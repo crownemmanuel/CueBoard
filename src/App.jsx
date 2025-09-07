@@ -960,6 +960,127 @@ function lighten(hex, amt) {
 export default App;
 
 function SettingsModal({ onClose }) {
+  const [backend, setBackend] = useState("web");
+  const [log, setLog] = useState([]);
+
+  // Native (Rust) state
+  const [inputs, setInputs] = useState([]);
+  const [outputs, setOutputs] = useState([]);
+  const [selectedIn, setSelectedIn] = useState(0);
+  const [selectedOut, setSelectedOut] = useState(0);
+
+  // Web MIDI state
+  const [midiAccess, setMidiAccess] = useState(null);
+  const [webInId, setWebInId] = useState("");
+  const [webOutId, setWebOutId] = useState("");
+  const [webSupported, setWebSupported] = useState(false);
+  const webInputRef = useRef(null);
+
+  useEffect(() => {
+    if (backend === "native") {
+      window.__TAURI__?.core
+        ?.invoke("midi_refresh")
+        .then((snap) => {
+          setInputs(snap?.inputs || []);
+          setOutputs(snap?.outputs || []);
+        })
+        .catch(() => {
+          setInputs([]);
+          setOutputs([]);
+        });
+      const unlisten = window.__TAURI__?.event?.listen?.(
+        "midi://message",
+        (event) => {
+          setLog((l) => [event.payload, ...l].slice(0, 200));
+        }
+      );
+      return () => {
+        if (typeof unlisten === "function") unlisten();
+      };
+    } else {
+      const supported =
+        typeof navigator !== "undefined" && "requestMIDIAccess" in navigator;
+      setWebSupported(!!supported);
+      if (!supported) return;
+      navigator
+        .requestMIDIAccess({ sysex: false })
+        .then((a) => {
+          setMidiAccess(a);
+          const ins = Array.from(a.inputs.values());
+          const outs = Array.from(a.outputs.values());
+          setWebInId(ins[0]?.id || "");
+          setWebOutId(outs[0]?.id || "");
+          a.onstatechange = () => {
+            // force refresh
+            setWebInId((id) => id);
+            setWebOutId((id) => id);
+          };
+        })
+        .catch(() => setMidiAccess(null));
+      return () => {
+        if (webInputRef.current) {
+          try {
+            webInputRef.current.onmidimessage = null;
+          } catch {}
+          webInputRef.current = null;
+        }
+      };
+    }
+  }, [backend]);
+
+  function connectInNative() {
+    window.__TAURI__?.core?.invoke("midi_open_input", {
+      inputIndex: Number(selectedIn),
+    });
+  }
+  function sendTestNative() {
+    const noteOn = [0x90, 60, 64];
+    const noteOff = [0x80, 60, 0];
+    window.__TAURI__?.core
+      ?.invoke("midi_open_output", { outputIndex: Number(selectedOut) })
+      .then(() => {
+        window.__TAURI__?.core?.invoke("midi_send", { bytes: noteOn });
+        setTimeout(() => {
+          window.__TAURI__?.core?.invoke("midi_send", { bytes: noteOff });
+        }, 200);
+      });
+  }
+
+  function connectInWeb() {
+    if (!midiAccess) return;
+    if (webInputRef.current) {
+      try {
+        webInputRef.current.onmidimessage = null;
+      } catch {}
+    }
+    for (const input of midiAccess.inputs.values()) {
+      if (input.id === webInId) {
+        webInputRef.current = input;
+        input.onmidimessage = (e) => {
+          setLog((l) => [{ data: Array.from(e.data) }, ...l].slice(0, 200));
+        };
+        break;
+      }
+    }
+  }
+  function sendTestWeb() {
+    if (!midiAccess) return;
+    let out = null;
+    for (const o of midiAccess.outputs.values()) {
+      if (o.id === webOutId) {
+        out = o;
+        break;
+      }
+    }
+    if (!out) return;
+    const noteOn = [0x90, 60, 64];
+    const noteOff = [0x80, 60, 0];
+    try {
+      out.send(noteOn);
+      setTimeout(() => out.send(noteOff), 200);
+    } catch {}
+  }
+
   return (
     <div className="modalBackdrop" onClick={onClose}>
       <div className="modal" onClick={(e) => e.stopPropagation()}>
@@ -989,18 +1110,140 @@ function SettingsModal({ onClose }) {
           <div style={{ margin: "16px 0", color: "#bbb" }}>MIDI</div>
           <div className="rowFlex">
             <div className="field">
-              <label>Controller</label>
-              <select defaultValue="apc40mk2">
-                <option value="apc40mk2">Akai APC40 MK2</option>
-                <option value="custom">Custom Mapping…</option>
+              <label>Backend</label>
+              <select
+                value={backend}
+                onChange={(e) => setBackend(e.target.value)}
+              >
+                <option value="web">Web MIDI (browser)</option>
+                <option value="native">Native (Rust)</option>
               </select>
             </div>
-            <div className="field">
-              <label>LED Feedback</label>
-              <select defaultValue="on">
-                <option value="on">On</option>
-                <option value="off">Off</option>
-              </select>
+          </div>
+
+          {backend === "native" ? (
+            <div className="rowFlex">
+              <div className="field">
+                <label>Input Device</label>
+                <select
+                  value={selectedIn}
+                  onChange={(e) => setSelectedIn(e.target.value)}
+                >
+                  {inputs.map((d, i) => (
+                    <option key={i} value={i}>
+                      {d.name}
+                    </option>
+                  ))}
+                </select>
+                <button
+                  className="btn sm"
+                  style={{ marginTop: 6 }}
+                  onClick={connectInNative}
+                >
+                  Connect
+                </button>
+              </div>
+              <div className="field">
+                <label>Output Device</label>
+                <select
+                  value={selectedOut}
+                  onChange={(e) => setSelectedOut(e.target.value)}
+                >
+                  {outputs.map((d, i) => (
+                    <option key={i} value={i}>
+                      {d.name}
+                    </option>
+                  ))}
+                </select>
+                <div style={{ display: "flex", gap: 6, marginTop: 6 }}>
+                  <button className="btn sm" onClick={sendTestNative}>
+                    Send Test Note
+                  </button>
+                </div>
+              </div>
+            </div>
+          ) : (
+            <>
+              <div className="rowFlex">
+                <div className="field">
+                  <label>Web MIDI Input</label>
+                  <select
+                    value={webInId}
+                    onChange={(e) => setWebInId(e.target.value)}
+                  >
+                    {midiAccess ? (
+                      Array.from(midiAccess.inputs.values()).map((d) => (
+                        <option key={d.id} value={d.id}>{`${
+                          d.manufacturer ? d.manufacturer + " " : ""
+                        }${d.name}`}</option>
+                      ))
+                    ) : (
+                      <option value="">
+                        {webSupported ? "No inputs" : "Not supported"}
+                      </option>
+                    )}
+                  </select>
+                  <button
+                    className="btn sm"
+                    style={{ marginTop: 6 }}
+                    onClick={connectInWeb}
+                    disabled={!midiAccess}
+                  >
+                    Connect
+                  </button>
+                </div>
+                <div className="field">
+                  <label>Web MIDI Output</label>
+                  <select
+                    value={webOutId}
+                    onChange={(e) => setWebOutId(e.target.value)}
+                  >
+                    {midiAccess ? (
+                      Array.from(midiAccess.outputs.values()).map((d) => (
+                        <option key={d.id} value={d.id}>{`${
+                          d.manufacturer ? d.manufacturer + " " : ""
+                        }${d.name}`}</option>
+                      ))
+                    ) : (
+                      <option value="">
+                        {webSupported ? "No outputs" : "Not supported"}
+                      </option>
+                    )}
+                  </select>
+                  <div style={{ display: "flex", gap: 6, marginTop: 6 }}>
+                    <button
+                      className="btn sm"
+                      onClick={sendTestWeb}
+                      disabled={!midiAccess}
+                    >
+                      Send Test Note
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </>
+          )}
+
+          <div className="field" style={{ marginTop: 10 }}>
+            <label>Incoming MIDI</label>
+            <div
+              style={{
+                height: 140,
+                overflow: "auto",
+                background: "#0f0f0f",
+                border: "1px solid #333",
+                borderRadius: 6,
+                padding: 8,
+              }}
+            >
+              {log.map((m, idx) => (
+                <div
+                  key={idx}
+                  style={{ fontFamily: "monospace", fontSize: 12 }}
+                >
+                  {Array.isArray(m.data) ? m.data.join(" ") : JSON.stringify(m)}
+                </div>
+              ))}
             </div>
           </div>
         </div>
