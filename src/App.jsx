@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import logoUrl from "./cue-board.logo.png";
 import WaveSurfer from "wavesurfer.js";
 import "./App.css";
 
@@ -44,6 +45,9 @@ const APC_ROWS = [
 // Group selector buttons (top row -> bottom row)
 // Notes provided: 82, 83, 84, 85, 86
 const GROUP_SELECT_NOTES = [82, 83, 84, 85, 86];
+// APC40 navigation buttons for scene switching (from user logs)
+const APC_NAV_UP_NOTE = 95; // previous scene
+const APC_NAV_DOWN_NOTE = 94; // next scene
 const NOTE_TO_GROUP_KEY = {
   82: "background", // topmost row
   83: "ambients", // second row
@@ -132,6 +136,12 @@ function App() {
   useEffect(() => {
     currentSceneRef.current = currentScene;
   }, [currentScene]);
+
+  // Keep latest show in a ref for async callbacks (e.g., MIDI handlers)
+  const showRef = useRef(show);
+  useEffect(() => {
+    showRef.current = show;
+  }, [show]);
 
   const groupColors = useMemo(() => {
     const map = {};
@@ -236,6 +246,15 @@ function App() {
                     ]);
                   } catch {}
                 }
+                return;
+              }
+              // Handle navigation buttons (Up/Down)
+              if (note === APC_NAV_UP_NOTE) {
+                prevScene();
+                return;
+              }
+              if (note === APC_NAV_DOWN_NOTE) {
+                nextScene();
                 return;
               }
               // Map APC clip grid
@@ -497,15 +516,22 @@ function App() {
   }
 
   function nextScene() {
-    const idx = show.scenes.findIndex((s) => s.id === currentSceneId);
-    const next = show.scenes[(idx + 1) % show.scenes.length];
-    setCurrentSceneId(next.id);
+    setCurrentSceneId((prevId) => {
+      const scenes = showRef.current?.scenes || [];
+      const idx = scenes.findIndex((s) => s.id === prevId);
+      if (idx < 0 || scenes.length === 0) return prevId;
+      const j = (idx + 1) % scenes.length;
+      return scenes[j].id;
+    });
   }
   function prevScene() {
-    const idx = show.scenes.findIndex((s) => s.id === currentSceneId);
-    const prev =
-      show.scenes[(idx - 1 + show.scenes.length) % show.scenes.length];
-    setCurrentSceneId(prev.id);
+    setCurrentSceneId((prevId) => {
+      const scenes = showRef.current?.scenes || [];
+      const idx = scenes.findIndex((s) => s.id === prevId);
+      if (idx < 0 || scenes.length === 0) return prevId;
+      const j = (idx - 1 + scenes.length) % scenes.length;
+      return scenes[j].id;
+    });
   }
 
   // --- APC mapping & LED helpers (component-scoped, use midiOut) ---
@@ -1057,6 +1083,9 @@ function App() {
   return (
     <div className="app">
       <aside className="sidebar">
+        <div className="brandRow">
+          <img src={logoUrl} alt="CueBoard" className="brandLogo" />
+        </div>
         <h2>Scenes</h2>
         {mode === "edit" && (
           <div className="sceneControls">
@@ -1362,7 +1391,7 @@ function App() {
 
         <div className="footer">
           <div>
-            Soundboard — {mode.toUpperCase()} — Scene: {currentScene.name}
+            CueBoard — {mode.toUpperCase()} — Scene: {currentScene.name}
           </div>
           <div>MIDI: {midiOut ? midiOut.name : "Offline"}</div>
         </div>
