@@ -41,6 +41,22 @@ const APC_ROWS = [
   [1, 2, 3, 4, 5, 6, 7, 8],
 ];
 
+// Group selector buttons (top row -> bottom row)
+// Notes provided: 82, 83, 84, 85, 86
+const GROUP_SELECT_NOTES = [82, 83, 84, 85, 86];
+const NOTE_TO_GROUP_KEY = {
+  82: "background", // topmost row
+  83: "ambients", // second row
+  84: "sfx", // third row
+  85: "group4", // placeholder for a future group
+  86: "group5", // placeholder for a future group
+};
+const GROUP_KEY_TO_NOTE = Object.fromEntries(
+  Object.entries(NOTE_TO_GROUP_KEY).map(([n, g]) => [g, Number(n)])
+);
+// Use channel 3 (0-based index 2) to match the provided image
+const GROUP_LED_CHANNEL = 2;
+
 function apcVelFromHex(hex) {
   if (!hex) return APC_NAME_TO_VEL.Green || 21;
   const key = hex.toUpperCase();
@@ -72,6 +88,8 @@ function App() {
     padId: null,
   });
   const [mapperOpen, setMapperOpen] = useState(false);
+  // Active group selection (e.g., which row we are controlling)
+  const [activeGroupKey, setActiveGroupKey] = useState("background");
 
   // Web MIDI state for APC LED control
   const [midiAccess, setMidiAccess] = useState(null);
@@ -146,6 +164,22 @@ function App() {
             // Note On with velocity > 0
             if ((status & 0xf0) === 0x90 && d2 > 0) {
               const note = d1 | 0; // 0..127
+              // Handle group selection buttons first
+              if (GROUP_SELECT_NOTES.includes(note)) {
+                const key = NOTE_TO_GROUP_KEY[note];
+                if (key) {
+                  setActiveGroupKey(key);
+                  // Visual feedback: set LED to Red (velocity 5) on channel 3
+                  try {
+                    midiOut?.send([
+                      0x90 | (GROUP_LED_CHANNEL & 0x0f),
+                      note & 0x7f,
+                      5, // red velocity
+                    ]);
+                  } catch {}
+                }
+                return;
+              }
               // Map APC clip grid
               const padNumber = apcNoteToPadNumber(note);
               if (padNumber) handleApcPadPress(padNumber - 1);
@@ -208,6 +242,22 @@ function App() {
     applySceneToAPC(currentScene);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [currentSceneId, midiOut]);
+
+  // Keep group selection LED in sync (light selected, clear others)
+  useEffect(() => {
+    try {
+      GROUP_SELECT_NOTES.forEach((n) => {
+        const isActive = NOTE_TO_GROUP_KEY[n] === activeGroupKey;
+        const status = isActive ? 0x90 : 0x80; // note on vs off
+        const vel = isActive ? 5 : 0; // red when active
+        midiOut?.send([
+          (status | (GROUP_LED_CHANNEL & 0x0f)) & 0xff,
+          n & 0x7f,
+          vel & 0x7f,
+        ]);
+      });
+    } catch {}
+  }, [activeGroupKey, midiOut]);
 
   // If group colors change, re-light current scene to reflect updates
   useEffect(() => {
@@ -360,6 +410,19 @@ function App() {
       midiOut.send(apcInitSysexMsg());
       apcInitedRef.current = true;
       setStatus((s) => `${s} — APC inited`);
+      // Also refresh group selection LED state upon init
+      GROUP_SELECT_NOTES.forEach((n) => {
+        const isActive = NOTE_TO_GROUP_KEY[n] === activeGroupKey;
+        const status = isActive ? 0x90 : 0x80;
+        const vel = isActive ? 5 : 0;
+        try {
+          midiOut.send([
+            (status | (GROUP_LED_CHANNEL & 0x0f)) & 0xff,
+            n & 0x7f,
+            vel & 0x7f,
+          ]);
+        } catch {}
+      });
     } catch {}
   }
 
@@ -712,6 +775,7 @@ function App() {
             pads={currentScene.background}
             groupKey="background"
             mode={mode}
+            active={activeGroupKey === "background"}
             onPadToggle={(id) => togglePadPlay("background", id)}
             onSetPlaying={(id, playing) =>
               setPadPlaying("background", id, playing)
@@ -729,6 +793,7 @@ function App() {
             pads={currentScene.ambients}
             groupKey="ambients"
             mode={mode}
+            active={activeGroupKey === "ambients"}
             onPadToggle={(id) => togglePadPlay("ambients", id)}
             onSetPlaying={(id, playing) =>
               setPadPlaying("ambients", id, playing)
@@ -746,6 +811,7 @@ function App() {
             pads={currentScene.sfx}
             groupKey="sfx"
             mode={mode}
+            active={activeGroupKey === "sfx"}
             onPadToggle={(id) => togglePadPlay("sfx", id)}
             onSetPlaying={(id, playing) => setPadPlaying("sfx", id, playing)}
             onLevelChange={(id, v) => setPadLevel("sfx", id, v)}
@@ -967,6 +1033,7 @@ function GroupSection({
   pads,
   groupKey,
   mode,
+  active,
   onPadToggle,
   onSetPlaying,
   onLevelChange,
@@ -979,7 +1046,24 @@ function GroupSection({
     <div className="groupBlock">
       <div className="groupHeader">
         <div className="dot" style={{ background: color }} />
-        <div className="title">{title}</div>
+        <div className="title">
+          {title}
+          {active && (
+            <span
+              style={{
+                marginLeft: 8,
+                color: "#ff4d4d",
+                fontWeight: 600,
+                fontSize: 12,
+                border: "1px solid #ff4d4d",
+                borderRadius: 4,
+                padding: "1px 6px",
+              }}
+            >
+              Active
+            </span>
+          )}
+        </div>
       </div>
       <div className="grid">
         {pads.map((p) => (
@@ -1241,6 +1325,55 @@ function PadCard({
                 >
                   {pad.playing ? "Pause" : "Play"}
                 </button>
+                {!pad.playing &&
+                  (() => {
+                    try {
+                      const ws = wsRef.current;
+                      const canResume =
+                        !!ws &&
+                        typeof ws.getCurrentTime === "function" &&
+                        ws.getCurrentTime() > 0;
+                      if (!canResume) return null;
+                    } catch {
+                      return null;
+                    }
+                    return (
+                      <button
+                        className="btn sm"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          try {
+                            const ws = wsRef.current;
+                            if (!ws) return;
+                            const target = pad.level || 0;
+                            const fadeMs =
+                              typeof pad.fadeInMs === "number"
+                                ? pad.fadeInMs
+                                : 0;
+                            if (fadeMs > 0) {
+                              ws.setVolume?.(0);
+                              ws.play?.();
+                              const t0 = performance.now();
+                              const step = (t) => {
+                                const p = Math.min(1, (t - t0) / fadeMs);
+                                const v = target * p;
+                                try {
+                                  ws.setVolume?.(v);
+                                } catch {}
+                                if (p < 1) requestAnimationFrame(step);
+                              };
+                              requestAnimationFrame(step);
+                            } else {
+                              ws.setVolume?.(target);
+                              ws.play?.();
+                            }
+                          } catch {}
+                        }}
+                      >
+                        Resume
+                      </button>
+                    );
+                  })()}
                 <input
                   type="range"
                   min="0"
