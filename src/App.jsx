@@ -2338,12 +2338,15 @@ function GroupSection({
             <span
               style={{
                 marginLeft: 8,
-                color: "#ff4d4d",
-                fontWeight: 600,
-                fontSize: 12,
-                border: "1px solid #ff4d4d",
-                borderRadius: 4,
-                padding: "1px 6px",
+                color: "#ffffff",
+                backgroundColor: "#ff4d4d",
+                fontWeight: 700,
+                fontSize: 16,
+                border: "2px solid #ff4d4d",
+                borderRadius: 6,
+                padding: "4px 12px",
+                textTransform: "uppercase",
+                letterSpacing: "0.5px",
               }}
             >
               Active
