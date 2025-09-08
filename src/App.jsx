@@ -263,11 +263,11 @@ function App() {
     };
   }, []);
 
-  // Reapply LEDs when scene or MIDI output changes
+  // Reapply LEDs and note mapping when the scene content or MIDI output changes
   useEffect(() => {
     applySceneToAPC(currentScene);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [currentSceneId, midiOut]);
+  }, [currentScene, midiOut]);
 
   // Keep group selection LED in sync (light selected, clear others)
   useEffect(() => {
@@ -290,6 +290,12 @@ function App() {
     applySceneToAPC(currentScene);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [show.groups]);
+
+  // Also reapply mapping/LEDs when pads in the current scene change
+  useEffect(() => {
+    applySceneToAPC(currentScene);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentScene.background, currentScene.ambients, currentScene.sfx]);
 
   // Revoke previous blob when quickUrl changes
   useEffect(() => {
@@ -530,23 +536,39 @@ function App() {
     mapGroupToRow(scene.background || [], 0); // 33..40
     mapGroupToRow(scene.ambients || [], 1); // 25..32
     mapGroupToRow(scene.sfx || [], 2); // 17..24
+
+    // Re-assert the currently selected group LED
+    try {
+      GROUP_SELECT_NOTES.forEach((n) => {
+        const isActive = NOTE_TO_GROUP_KEY[n] === activeGroupKey;
+        const status = isActive ? 0x90 : 0x80; // note on vs off
+        const vel = isActive ? 5 : 0;
+        midiOut?.send([
+          (status | (GROUP_LED_CHANNEL & 0x0f)) & 0xff,
+          n & 0x7f,
+          vel & 0x7f,
+        ]);
+      });
+    } catch {}
   }
 
   function handleApcPadPress(note /*0..39*/) {
     // Map incoming APC note back to group/pad index by our scene mapping
+    const scene = currentSceneRef.current;
+    if (!scene) return;
     const padNumber = note + 1; // 1..40
     // Determine row and col
     const rowIdx = APC_ROWS.findIndex((row) => row.includes(padNumber));
     if (rowIdx < 0) return;
     const colIdx = APC_ROWS[rowIdx].indexOf(padNumber);
     if (rowIdx === 0) {
-      const p = currentScene.background[colIdx];
+      const p = (scene.background || [])[colIdx];
       if (p) togglePadPlay("background", p.id);
     } else if (rowIdx === 1) {
-      const p = currentScene.ambients[colIdx];
+      const p = (scene.ambients || [])[colIdx];
       if (p) togglePadPlay("ambients", p.id);
     } else if (rowIdx === 2) {
-      const p = currentScene.sfx[colIdx];
+      const p = (scene.sfx || [])[colIdx];
       if (p) togglePadPlay("sfx", p.id);
     }
   }
