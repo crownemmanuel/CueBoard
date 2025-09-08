@@ -205,7 +205,8 @@ body {
 
 .pad.playing {
   filter: brightness(1.06);
-  box-shadow: 0 0 20px rgba(249, 28, 16, 0.8), 0 0 40px rgba(255, 0, 0, 0.4);
+  box-shadow: 0 0 20px rgba(255, 255, 255, 0.966),
+    0 0 40px rgba(246, 238, 0, 0.4);
 }
 
 .padHeader {

@@ -80,9 +80,20 @@ function chooseDefaultOutput(access, preferId) {
 function App() {
   const [mode, setMode] = useState("show"); // "show" | "edit"
   const [status, setStatus] = useState("Ready");
-  const [show, setShow] = useState(
-    () => loadSavedShow() || createInitialShow()
-  );
+  const [show, setShow] = useState(() => {
+    const saved = loadSavedShow() || createInitialShow();
+    // Clear all playing states on app load to prevent stale ticker animations
+    saved.scenes.forEach((scene) => {
+      ["background", "ambients", "sfx"].forEach((groupKey) => {
+        if (scene[groupKey]) {
+          scene[groupKey].forEach((pad) => {
+            pad.playing = false;
+          });
+        }
+      });
+    });
+    return saved;
+  });
   const [currentSceneId, setCurrentSceneId] = useState(show.scenes[0]?.id);
   const [selectedPadKey, setSelectedPadKey] = useState(null);
   const [notesOpen, setNotesOpen] = useState(true);
@@ -866,12 +877,16 @@ function App() {
     return `${sceneId}:${groupKey}:${padId}`;
   }
 
-  function handlePadAudio(scene, groupKey, pad, shouldPlay) {
+  function handlePadAudio(scene, groupKey, pad, shouldPlay, usePause = false) {
     if (!pad.assetUrl && !pad.assetPath) return;
     if (shouldPlay) {
       playPad(scene.id, groupKey, pad);
     } else {
-      stopPad(scene.id, groupKey, pad.id);
+      if (usePause) {
+        pausePad(scene.id, groupKey, pad.id);
+      } else {
+        stopPad(scene.id, groupKey, pad.id);
+      }
     }
   }
 
@@ -994,6 +1009,100 @@ function App() {
     padAudioRef.current.delete(key);
   }
 
+  // Pause playback without resetting position (for resume functionality)
+  function pausePad(sceneId, groupKey, padId) {
+    const key = padKey(sceneId, groupKey, padId);
+    console.log("pausePad called for key:", key);
+    const ref = padAudioRef.current.get(key);
+    if (!ref) {
+      console.log("No ref found for pause");
+      return;
+    }
+    try {
+      console.log("Pausing audio at currentTime:", ref.el.currentTime);
+      ref.el.pause();
+      // Don't reset currentTime - keep position for resume
+    } catch (error) {
+      console.log("Pause error:", error);
+    }
+  }
+
+  // Resume playback from current position (doesn't reset to beginning)
+  function resumePad(sceneId, groupKey, pad) {
+    const key = padKey(sceneId, groupKey, pad.id);
+    console.log("resumePad called for key:", key);
+    let ref = padAudioRef.current.get(key);
+    console.log("Existing ref found:", !!ref);
+
+    // If no audio element exists, create one first (but don't play from beginning)
+    if (!ref) {
+      console.log("No existing ref, creating new audio element");
+      const srcUrl =
+        pad.assetUrl ||
+        (/^(https?:|blob:|tauri:)/.test(pad.assetPath || "")
+          ? pad.assetPath
+          : null);
+
+      if (!srcUrl) {
+        setStatus("No audio file to resume");
+        return;
+      }
+
+      const el = new Audio(srcUrl);
+      el.crossOrigin = "anonymous";
+      el.loop = pad.playbackMode === "loop";
+      el.volume = clamp01(pad.level || 0.8);
+
+      try {
+        const routeKey = getRouteKeyForPad(groupKey, pad);
+        const deviceId = getDeviceIdForRouteKey(routeKey);
+        if (typeof el.setSinkId === "function" && deviceId) {
+          Promise.resolve(el.setSinkId(deviceId)).catch(() => {});
+        }
+      } catch {}
+
+      el.currentTime = 0; // Start from beginning for resume if no previous position
+      ref = { el };
+      padAudioRef.current.set(key, ref);
+
+      el.onended = () => {
+        if (!el.loop) {
+          updateScene((scene) => {
+            const sc = structuredClone(scene);
+            const arr = groupArray(sc, groupKey);
+            const p = arr.find((x) => x.id === pad.id);
+            if (p) p.playing = false;
+            return sc;
+          });
+        }
+      };
+    }
+
+    try {
+      console.log(
+        "Attempting to resume audio, currentTime:",
+        ref.el.currentTime,
+        "duration:",
+        ref.el.duration
+      );
+      // Just resume without resetting currentTime
+      const p = ref.el.play();
+      if (p && typeof p.then === "function") {
+        p.then(() => {
+          console.log("Resume successful");
+        }).catch((error) => {
+          console.log("Resume failed:", error);
+          setStatus("Playback was blocked");
+        });
+      } else {
+        console.log("Resume play() returned synchronously");
+      }
+    } catch (error) {
+      console.log("Resume error:", error);
+      setStatus("Playback error");
+    }
+  }
+
   function applyPadVolume(sceneId, groupKey, padId, level) {
     const key = padKey(sceneId, groupKey, padId);
     const ref = padAudioRef.current.get(key);
@@ -1081,14 +1190,8 @@ function App() {
       const [gk, p] = found;
       if (t.action === "play") {
         setPadPlaying(gk, p.id, true, targetScene.id);
-        if (targetScene.id !== currentScene.id) {
-          playPad(targetScene.id, gk, p);
-        }
       } else if (t.action === "stop") {
         setPadPlaying(gk, p.id, false, targetScene.id);
-        if (targetScene.id !== currentScene.id) {
-          stopPad(targetScene.id, gk, p.id);
-        }
       } else if (
         t.action === "fade" ||
         t.action === "fadeIn" ||
@@ -1679,7 +1782,7 @@ function App() {
   );
 
   // Actions on pads
-  function togglePadPlay(groupKey, id) {
+  function togglePadPlay(groupKey, id, usePause = false) {
     updateScene((scene) => {
       const pad = findPad(scene, groupKey, id);
       if (!pad) return scene;
@@ -1688,8 +1791,12 @@ function App() {
         return scene;
       }
       const next = !pad.playing;
-      setPadPlaying(groupKey, id, next);
-      setStatus(`${pad.label || pad.name} ${next ? "started" : "stopped"}`);
+      setPadPlaying(groupKey, id, next, null, false, usePause);
+      setStatus(
+        `${pad.label || pad.name} ${
+          next ? "started" : usePause ? "paused" : "stopped"
+        }`
+      );
       return scene;
     });
   }
@@ -1738,7 +1845,14 @@ function App() {
     } catch {}
   }
 
-  function setPadPlaying(groupKey, id, playing, sceneIdOverride) {
+  function setPadPlaying(
+    groupKey,
+    id,
+    playing,
+    sceneIdOverride,
+    useResume = false,
+    usePause = false
+  ) {
     const targetSceneId =
       sceneIdOverride ||
       (currentSceneRef.current && currentSceneRef.current.id) ||
@@ -1747,7 +1861,11 @@ function App() {
       const pad = findPad(scene, groupKey, id);
       if (!pad) return scene;
       pad.playing = !!playing;
-      handlePadAudio(scene, groupKey, pad, !!playing);
+      if (!useResume) {
+        // Use pause when stopping (playing = false) to preserve position for resume
+        const shouldUsePause = !playing;
+        handlePadAudio(scene, groupKey, pad, !!playing, shouldUsePause);
+      }
       return scene;
     };
     if (
@@ -2048,17 +2166,18 @@ function PadCard({
     } catch {}
   }, [pad.level]);
 
-  // Sync waveform progress with pad play/pause
+  // Sync waveform progress with pad play/pause (don't play audio through WaveSurfer)
   useEffect(() => {
     const ws = wsRef.current;
     if (!ws) return;
     try {
       if (pad.playing) {
+        // Just seek to start for visualization - don't play audio
         try {
           ws.seekTo?.(0);
         } catch {}
-        ws.play?.().catch(() => {});
       } else {
+        // Pause and seek to start when not playing
         ws.pause?.();
         try {
           ws.seekTo?.(0);
@@ -2133,15 +2252,60 @@ function PadCard({
               <div className="waveContainer" ref={waveRef} />
               {pad.playing && <div className="playingTicker" />}
               <div className="waveControls">
-                <button
-                  className="btn sm"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    onToggle?.();
-                  }}
-                >
-                  {pad.playing ? "Pause" : "Play"}
-                </button>
+                {!pad.playing && (pad.assetUrl || pad.assetPath) ? (
+                  <div style={{ display: "flex", gap: "8px" }}>
+                    <button
+                      className="btn sm"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        // Play from beginning (don't use pause)
+                        onToggle?.();
+                      }}
+                    >
+                      Play
+                    </button>
+                    <button
+                      className="btn sm"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        console.log("Resume button clicked for pad:", pad.id);
+                        // Resume from current position
+                        const scene = currentSceneRef.current;
+                        if (scene) {
+                          const padRef = findPad(scene, groupKey, pad.id);
+                          if (padRef) {
+                            console.log("Found pad, calling resumePad");
+                            resumePad(scene.id, groupKey, padRef);
+                            setPadPlaying(groupKey, pad.id, true, null, true);
+                            setStatus(`${pad.label || pad.name} resumed`);
+                          } else {
+                            console.log("Pad not found in scene");
+                          }
+                        } else {
+                          console.log("No current scene found");
+                        }
+                      }}
+                    >
+                      Resume
+                    </button>
+                  </div>
+                ) : (
+                  <button
+                    className="btn sm"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      if (pad.playing) {
+                        // Pause (preserve position for resume)
+                        onSetPlaying?.(false);
+                      } else {
+                        // Play from beginning
+                        onToggle?.();
+                      }
+                    }}
+                  >
+                    {pad.playing ? "Pause" : "Play"}
+                  </button>
+                )}
                 <input
                   type="range"
                   min="0"
