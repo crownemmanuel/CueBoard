@@ -429,6 +429,28 @@ function App() {
     };
   }, [quickUrl]);
 
+  // Listen for cross-component pad seek events from waveform UI
+  useEffect(() => {
+    const onPadSeek = (e) => {
+      try {
+        const detail = e?.detail || {};
+        const gid = detail.groupKey;
+        const pid = detail.padId;
+        const progress = detail.progress;
+        const sid =
+          detail.sceneId ||
+          (currentSceneRef.current && currentSceneRef.current.id) ||
+          currentScene.id;
+        if (gid && pid && typeof progress === "number") {
+          seekPad(sid, gid, pid, progress);
+        }
+      } catch {}
+    };
+    window.addEventListener("padSeek", onPadSeek);
+    return () => window.removeEventListener("padSeek", onPadSeek);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   // On initial load, try auto-relink using a previously saved directory handle.
   // If not possible or not permitted, offer to relink manually once.
   useEffect(() => {
@@ -480,10 +502,13 @@ function App() {
   }, [selectedPadKey, currentSceneId, show]);
 
   function updateScene(mutator) {
+    const selectedSceneId =
+      (currentSceneRef.current && currentSceneRef.current.id) ||
+      currentScene.id;
     setShow((prev) => ({
       ...prev,
       scenes: prev.scenes.map((s) =>
-        s.id === currentScene.id ? mutator(structuredClone(s)) : s
+        s.id === selectedSceneId ? mutator(structuredClone(s)) : s
       ),
     }));
   }
@@ -852,7 +877,8 @@ function App() {
 
   function playPad(sceneId, groupKey, pad) {
     const key = padKey(sceneId, groupKey, pad.id);
-    stopPad(sceneId, groupKey, pad.id);
+    // Ensure any previous instance is fully stopped immediately to avoid overlapping
+    stopPadImmediate(sceneId, groupKey, pad.id);
     const srcUrl =
       pad.assetUrl ||
       (/^(https?:|blob:|tauri:)/.test(pad.assetPath || "")
@@ -874,7 +900,18 @@ function App() {
         Promise.resolve(el.setSinkId(deviceId)).catch(() => {});
       }
     } catch {}
-    el.volume = clamp01(pad.level ?? 0.8);
+    // Determine target level and whether to fade in
+    const targetLevel =
+      typeof pad.baseLevel === "number"
+        ? pad.baseLevel
+        : typeof pad.level === "number"
+        ? pad.level
+        : 0.8;
+    const fadeInMs = Math.max(
+      0,
+      Number.isFinite(pad.fadeInMs) ? pad.fadeInMs : 0
+    );
+    el.volume = clamp01(fadeInMs > 0 ? 0 : targetLevel);
     padAudioRef.current.set(key, { el });
     el.onended = () => {
       if (!el.loop) {
@@ -902,9 +939,51 @@ function App() {
     } catch {
       setStatus("Playback error");
     }
+    // Apply default fade-in if configured
+    if (fadeInMs > 0) {
+      // Ensure the audio element reference exists, then fade up
+      const ensure = () => {
+        const ref = padAudioRef.current.get(key);
+        if (!ref) {
+          requestAnimationFrame(ensure);
+          return;
+        }
+        applyPadVolume(sceneId, groupKey, pad.id, 0);
+        fadeVolume(sceneId, groupKey, pad.id, 0, targetLevel, fadeInMs);
+      };
+      ensure();
+    }
   }
 
   function stopPad(sceneId, groupKey, padId) {
+    const key = padKey(sceneId, groupKey, padId);
+    const ref = padAudioRef.current.get(key);
+    if (!ref) return;
+    // Look up pad to fetch its fadeOutMs; fall back to immediate stop
+    let fadeOutMs = 0;
+    try {
+      const sc =
+        (show.scenes || []).find((s) => s.id === sceneId) ||
+        currentSceneRef.current ||
+        currentScene;
+      const pad = findPad(sc, groupKey, padId);
+      fadeOutMs = Math.max(
+        0,
+        Number.isFinite(pad?.fadeOutMs) ? pad.fadeOutMs : 0
+      );
+    } catch {}
+    if (fadeOutMs > 0) {
+      const currentVol = ref.el.volume;
+      fadeVolume(sceneId, groupKey, padId, currentVol, 0, fadeOutMs, () => {
+        stopPadImmediate(sceneId, groupKey, padId);
+      });
+    } else {
+      stopPadImmediate(sceneId, groupKey, padId);
+    }
+  }
+
+  // Immediate stop helper used internally to avoid overlap during retriggers
+  function stopPadImmediate(sceneId, groupKey, padId) {
     const key = padKey(sceneId, groupKey, padId);
     const ref = padAudioRef.current.get(key);
     if (!ref) return;
@@ -935,6 +1014,20 @@ function App() {
       else onDone && onDone();
     };
     requestAnimationFrame(step);
+  }
+
+  // Seek currently playing audio for a pad to the given progress (0..1)
+  function seekPad(sceneId, groupKey, padId, progress /*0..1*/) {
+    const key = padKey(sceneId, groupKey, padId);
+    const ref = padAudioRef.current.get(key);
+    if (!ref) return;
+    try {
+      const p = Math.max(0, Math.min(1, Number(progress) || 0));
+      const dur = Number(ref.el.duration);
+      if (Number.isFinite(dur) && dur > 0) {
+        ref.el.currentTime = dur * p;
+      }
+    } catch {}
   }
 
   function stopAllAudio() {
@@ -1598,14 +1691,21 @@ function App() {
   }
 
   function setPadLevel(groupKey, id, value, sceneIdOverride) {
-    const targetSceneId = sceneIdOverride || currentScene.id;
+    const targetSceneId =
+      sceneIdOverride ||
+      (currentSceneRef.current && currentSceneRef.current.id) ||
+      currentScene.id;
     const updater = (scene) => {
       const pad = findPad(scene, groupKey, id);
       if (!pad) return scene;
       pad.level = value;
       return scene;
     };
-    if (targetSceneId !== currentScene.id) {
+    if (
+      targetSceneId !==
+      ((currentSceneRef.current && currentSceneRef.current.id) ||
+        currentScene.id)
+    ) {
       updateSceneById(targetSceneId, updater);
     } else {
       updateScene(updater);
@@ -1625,7 +1725,9 @@ function App() {
     } catch {}
     try {
       const sc =
-        (show.scenes || []).find((s) => s.id === targetSceneId) || currentScene;
+        (show.scenes || []).find((s) => s.id === targetSceneId) ||
+        currentSceneRef.current ||
+        currentScene;
       const pad = findPad(sc, groupKey, id);
       if (pad)
         setStatus(`${pad.label || pad.name} level ${(value * 100) | 0}%`);
@@ -1633,7 +1735,10 @@ function App() {
   }
 
   function setPadPlaying(groupKey, id, playing, sceneIdOverride) {
-    const targetSceneId = sceneIdOverride || currentScene.id;
+    const targetSceneId =
+      sceneIdOverride ||
+      (currentSceneRef.current && currentSceneRef.current.id) ||
+      currentScene.id;
     const updater = (scene) => {
       const pad = findPad(scene, groupKey, id);
       if (!pad) return scene;
@@ -1641,14 +1746,19 @@ function App() {
       handlePadAudio(scene, groupKey, pad, !!playing);
       return scene;
     };
-    if (targetSceneId !== currentScene.id)
+    if (
+      targetSceneId !==
+      ((currentSceneRef.current && currentSceneRef.current.id) ||
+        currentScene.id)
+    )
       updateSceneById(targetSceneId, updater);
     else updateScene(updater);
     // Fire triggers for this pad state change
     try {
       const sc =
         (show.scenes || []).find((s) => s.id === targetSceneId) ||
-        currentSceneRef.current;
+        currentSceneRef.current ||
+        currentScene;
       const pad = findPad(sc, groupKey, id);
       if (pad) runPadTriggers(sc, pad, playing ? "onStart" : "onStop");
     } catch {}
@@ -1896,6 +2006,15 @@ function PadCard({
       barWidth: 2,
       normalize: true,
     });
+    // Reflect seeks on the main audio element for this pad
+    try {
+      wsRef.current.on("seek", (progress) => {
+        const evt = new CustomEvent("padSeek", {
+          detail: { sceneId: null, groupKey, padId: pad.id, progress },
+        });
+        window.dispatchEvent(evt);
+      });
+    } catch {}
     try {
       const p = wsRef.current.load(pad.assetUrl || pad.assetPath);
       if (p && typeof p.catch === "function") {
@@ -2005,6 +2124,7 @@ function PadCard({
           {pad.assetUrl || pad.assetPath ? (
             <>
               <div className="waveContainer" ref={waveRef} />
+              {pad.playing && <div className="playingTicker" />}
               <div className="waveControls">
                 <button
                   className="btn sm"

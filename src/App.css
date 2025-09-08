@@ -205,6 +205,8 @@ body {
 
 .pad.playing {
   filter: brightness(1.06);
+  outline: 2px solid var(--red);
+  box-shadow: 0 0 0 3px rgba(225, 77, 77, 0.35) inset;
 }
 
 .padHeader {
@@ -235,6 +237,38 @@ body {
   align-items: stretch;
   padding: 10px 12px 12px 12px;
   gap: 10px;
+}
+
+/* Animated ticker for playing pads */
+.playingTicker {
+  position: absolute;
+  left: 0;
+  bottom: 0;
+  height: 4px;
+  width: 100%;
+  overflow: hidden;
+}
+.playingTicker::before {
+  content: "";
+  display: block;
+  height: 100%;
+  width: 25%;
+  background: linear-gradient(
+    90deg,
+    rgba(225, 77, 77, 0.1),
+    rgba(225, 77, 77, 0.9),
+    rgba(225, 77, 77, 0.1)
+  );
+  animation: tickerSlide 1.6s ease-in-out infinite alternate;
+}
+
+@keyframes tickerSlide {
+  0% {
+    transform: translateX(0%);
+  }
+  100% {
+    transform: translateX(300%);
+  }
 }
 
 .playArea {
