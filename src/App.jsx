@@ -2121,6 +2121,8 @@ function App() {
       sceneIdOverride ||
       (currentSceneRef.current && currentSceneRef.current.id) ||
       currentScene.id;
+
+    let updatedScene = null;
     const updater = (scene) => {
       const pad = findPad(scene, groupKey, id);
       if (!pad) return scene;
@@ -2150,8 +2152,10 @@ function App() {
         const shouldUsePause = !playing;
         handlePadAudio(scene, groupKey, pad, !!playing, shouldUsePause);
       }
+      updatedScene = scene; // Capture the updated scene for triggers
       return scene;
     };
+
     if (
       targetSceneId !==
       ((currentSceneRef.current && currentSceneRef.current.id) ||
@@ -2159,9 +2163,11 @@ function App() {
     )
       updateSceneById(targetSceneId, updater);
     else updateScene(updater);
-    // Fire triggers for this pad state change
+
+    // Fire triggers for this pad state change using the updated scene
     try {
       const sc =
+        updatedScene || // Use the scene that was just updated
         (show.scenes || []).find((s) => s.id === targetSceneId) ||
         currentSceneRef.current ||
         currentScene;
