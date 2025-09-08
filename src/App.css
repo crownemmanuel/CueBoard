@@ -95,8 +95,9 @@ body {
 }
 
 .sceneItem.active {
-  background: #4a4a4a;
-  outline: 1px solid #5a5a5a;
+  background: rgba(242, 184, 75, 0.14);
+  outline: 2px solid var(--amber);
+  box-shadow: 0 0 0 2px rgba(242, 184, 75, 0.15) inset;
 }
 
 .main {
@@ -136,6 +137,13 @@ body {
 }
 .btn.gray {
   background: #4a4a4a;
+}
+
+/* Active/primary toggle button state */
+.activeBtn {
+  box-shadow: 0 0 0 2px rgba(242, 184, 75, 0.35) inset;
+  background: rgba(242, 184, 75, 0.22);
+  color: #fff;
 }
 
 .content {

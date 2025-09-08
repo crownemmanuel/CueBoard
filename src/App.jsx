@@ -81,7 +81,6 @@ function App() {
   );
   const [currentSceneId, setCurrentSceneId] = useState(show.scenes[0]?.id);
   const [selectedPadKey, setSelectedPadKey] = useState(null);
-  const [legendOpen, setLegendOpen] = useState(true);
   const [notesOpen, setNotesOpen] = useState(true);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [editor, setEditor] = useState({
@@ -381,10 +380,10 @@ function App() {
         e.preventDefault();
       } else if (e.key.toLowerCase() === "s") {
         handleStopAll();
-      } else if (e.key.toLowerCase() === "f") {
-        handleFadeAll();
-      } else if (e.key.toLowerCase() === "p") {
-        handlePanic();
+      } else if (e.key.toLowerCase() === "n") {
+        nextScene();
+      } else if (e.key.toLowerCase() === "b") {
+        prevScene();
       }
     };
     window.addEventListener("keydown", onKey);
@@ -494,6 +493,12 @@ function App() {
     const idx = show.scenes.findIndex((s) => s.id === currentSceneId);
     const next = show.scenes[(idx + 1) % show.scenes.length];
     setCurrentSceneId(next.id);
+  }
+  function prevScene() {
+    const idx = show.scenes.findIndex((s) => s.id === currentSceneId);
+    const prev =
+      show.scenes[(idx - 1 + show.scenes.length) % show.scenes.length];
+    setCurrentSceneId(prev.id);
   }
 
   // --- APC mapping & LED helpers (component-scoped, use midiOut) ---
@@ -944,7 +949,11 @@ function App() {
             className={"sceneItem" + (s.id === currentSceneId ? " active" : "")}
             onClick={() => setCurrentSceneId(s.id)}
           >
-            {s.name}
+            <span
+              style={s.id === currentSceneId ? { color: "#ffeb3b" } : undefined}
+            >
+              {s.name}
+            </span>
           </div>
         ))}
         {mode === "edit" && (
@@ -1014,32 +1023,49 @@ function App() {
 
       <div className="main">
         <div className="topbar">
-          <button className="btn gray" onClick={() => setMode("edit")}>
+          <button
+            className={"btn gray" + (mode === "edit" ? " activeBtn" : "")}
+            onClick={() => setMode("edit")}
+          >
             Edit
           </button>
-          <button className="btn gray" onClick={() => setMode("show")}>
+          <button
+            className={"btn gray" + (mode === "show" ? " activeBtn" : "")}
+            style={
+              mode === "show"
+                ? {
+                    background: "rgba(242,184,75,0.25)",
+                    boxShadow: "0 0 0 2px rgba(242,184,75,0.35) inset",
+                  }
+                : undefined
+            }
+            onClick={() => setMode("show")}
+          >
             Show
           </button>
-          <button className="btn blue" onClick={handleRememberCapture}>
-            Remember
+          <button
+            className={"btn blue" + (mode === "edit" ? " activeBtn" : "")}
+            onClick={handleRememberCapture}
+          >
+            Save Mix
           </button>
-          <button className="btn" onClick={handleStopAll}>
-            Stop All
+          <button className="btn red" onClick={handleStopAll}>
+            Stop All (S)
           </button>
-          <button className="btn" onClick={handleFadeAll}>
-            Fade All
+          <button
+            className={"btn" + (mode === "show" ? " activeBtn" : "")}
+            onClick={prevScene}
+          >
+            Prev Scene (B)
           </button>
-          <button className="btn red" onClick={handlePanic}>
-            Panic
-          </button>
-          <button className="btn" onClick={nextScene}>
-            Next Scene
+          <button
+            className={"btn" + (mode === "show" ? " activeBtn" : "")}
+            onClick={nextScene}
+          >
+            Next Scene (N)
           </button>
           <button className="btn" onClick={() => setNotesOpen((v) => !v)}>
             {notesOpen ? "Hide Notes" : "Show Notes"}
-          </button>
-          <button className="btn" onClick={() => setLegendOpen((v) => !v)}>
-            {legendOpen ? "Hide Tips" : "Show Tips"}
           </button>
           <button className="btn" onClick={() => setSettingsOpen(true)}>
             Settings
@@ -1067,7 +1093,7 @@ function App() {
         </div>
 
         <div className="content">
-          {legendOpen && <Legend onClose={() => setLegendOpen(false)} />}
+          {/* Tips panel removed per UI cleanup */}
 
           <GroupSection
             title="Background Music"
@@ -2436,7 +2462,7 @@ function SettingsModal({ onClose }) {
           </button>
         </div>
         <div className="modalBody">
-          <div style={{ marginBottom: 10, color: "#bbb" }}>Audio</div>
+          <div style={{ display: "none" }}>Audio</div>
           <div className="rowFlex">
             <div className="field">
               <label>Master Device</label>
@@ -2452,27 +2478,7 @@ function SettingsModal({ onClose }) {
               </select>
             </div>
           </div>
-          <div style={{ margin: "16px 0", color: "#bbb" }}>
-            Audio Test Player
-          </div>
-          <div className="field">
-            <label>Pick audio file (mp3/wav/ogg)</label>
-            <input type="file" accept="audio/*" onChange={onPickTestFile} />
-          </div>
-          <div className="field">
-            <label>{testName || "No file selected"}</label>
-            <audio
-              ref={audioRef}
-              controls
-              src={testUrl}
-              onError={onAudioError}
-              onCanPlay={onAudioCanPlay}
-              style={{ width: "100%" }}
-            />
-            <div style={{ color: testMsg.includes("fail") ? "#e66" : "#8dd" }}>
-              {testMsg}
-            </div>
-          </div>
+          {/* Audio Test Player removed per UI cleanup */}
           <div style={{ margin: "16px 0", color: "#bbb" }}>MIDI (Web MIDI)</div>
           <div className="rowFlex">
             <div className="field">
@@ -2658,9 +2664,9 @@ function ApcMapperModal({ onClose }) {
             <div className="field" style={{ flex: 2 }}>
               <label>Instructions</label>
               <div style={{ color: "#bbb" }}>
-                Press each clip pad you intend to use (top rows). We will record
-                the incoming NOTE number. After pressing 1..40 in your physical
-                grid, copy the table below and send it back.
+                Use this panel to monitor captured input from your MIDI
+                controller. Interact with your device (pads/keys/knobs/faders)
+                and observe the incoming NOTE/CC/channel data in the log below.
               </div>
             </div>
           </div>
