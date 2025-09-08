@@ -1103,7 +1103,14 @@ function PadCard({
   onEdit,
   onDelete,
 }) {
-  const headerStyle = { background: "rgba(0,0,0,.18)", color: "#fff" };
+  const headerStyle = {
+    background: "rgba(0,0,0,.18)",
+    color: "#fff",
+    fontSize: 20,
+    fontWeight: 700,
+    lineHeight: "28px",
+    padding: "8px 10px",
+  };
   const resolvedBase = pad.color || "#2a2a2a";
   const bodyColor = pad.playing ? lighten(resolvedBase, 0.12) : resolvedBase;
 
@@ -1123,7 +1130,7 @@ function PadCard({
       waveColor: "#4fc3f7",
       progressColor: "#03dac6",
       cursorColor: "#eee",
-      height: 56,
+      height: 36,
       barWidth: 2,
       normalize: true,
     });
