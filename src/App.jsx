@@ -46,8 +46,8 @@ const APC_ROWS = [
 // Notes provided: 82, 83, 84, 85, 86
 const GROUP_SELECT_NOTES = [82, 83, 84, 85, 86];
 // APC40 navigation buttons for scene switching (from user logs)
-const APC_NAV_UP_NOTE = 95; // previous scene
-const APC_NAV_DOWN_NOTE = 94; // next scene
+const APC_NAV_UP_NOTE = 94; // previous scene
+const APC_NAV_DOWN_NOTE = 95; // next scene
 const NOTE_TO_GROUP_KEY = {
   82: "background", // topmost row
   83: "ambients", // second row
