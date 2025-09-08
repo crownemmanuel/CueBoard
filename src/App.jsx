@@ -18,7 +18,7 @@ const APC_COLOR_TABLE = [
   { name: "Aqua", vel: 90, hex: "#00FFFF" },
   { name: "Blue", vel: 45, hex: "#0000FF" },
   { name: "Light Blue", vel: 91, hex: "#66B2FF" },
-  { name: "Purple", vel: 49, hex: "#5A00FF" },
+  { name: "Purple", vel: 49, hex: "#a900ff" },
   { name: "Magenta", vel: 53, hex: "#FF00FF" },
   { name: "Bright Magenta", vel: 94, hex: "#FF66FF" },
 ];

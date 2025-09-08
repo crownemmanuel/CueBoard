@@ -205,8 +205,7 @@ body {
 
 .pad.playing {
   filter: brightness(1.06);
-  outline: 2px solid var(--red);
-  box-shadow: 0 0 0 3px rgba(225, 77, 77, 0.35) inset;
+  box-shadow: 0 0 20px rgba(255, 0, 0, 0.8), 0 0 40px rgba(255, 0, 0, 0.4);
 }
 
 .padHeader {
@@ -244,7 +243,7 @@ body {
   position: absolute;
   left: 0;
   bottom: 0;
-  height: 4px;
+  height: 10px;
   width: 100%;
   overflow: hidden;
 }
