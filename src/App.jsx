@@ -2147,8 +2147,8 @@ function App() {
           setStatus(`${pad.label || pad.name} resumed`);
         }
       } else {
-        // Use pause when stopping (playing = false) to preserve position for resume
-        const shouldUsePause = !playing;
+        // Use pause when usePause is true, otherwise use stop (which includes fade out)
+        const shouldUsePause = usePause && !playing;
         handlePadAudio(scene, groupKey, pad, !!playing, shouldUsePause);
       }
       return scene;
