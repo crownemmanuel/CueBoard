@@ -76,7 +76,9 @@ function chooseDefaultOutput(access, preferId) {
 function App() {
   const [mode, setMode] = useState("show"); // "show" | "edit"
   const [status, setStatus] = useState("Ready");
-  const [show, setShow] = useState(() => createInitialShow());
+  const [show, setShow] = useState(
+    () => loadSavedShow() || createInitialShow()
+  );
   const [currentSceneId, setCurrentSceneId] = useState(show.scenes[0]?.id);
   const [selectedPadKey, setSelectedPadKey] = useState(null);
   const [legendOpen, setLegendOpen] = useState(true);
@@ -117,6 +119,10 @@ function App() {
   const [quickUrl, setQuickUrl] = useState("");
   const [quickName, setQuickName] = useState("");
   const quickAudioRef = useRef(null);
+  const importInputRef = useRef(null);
+  const attemptedAutoRelinkRef = useRef(false);
+  const [relinkRequired, setRelinkRequired] = useState(false);
+  const [relinkMissingCount, setRelinkMissingCount] = useState(0);
 
   const currentScene = useMemo(() => {
     return show.scenes.find((s) => s.id === currentSceneId) || show.scenes[0];
@@ -133,6 +139,33 @@ function App() {
     (show.groups || []).forEach((g) => (map[g.id] = g.color));
     return map;
   }, [show.groups]);
+
+  // Restore last selected scene if available
+  useEffect(() => {
+    try {
+      const saved = localStorage.getItem("soundboard.currentSceneId");
+      if (saved && show.scenes.some((s) => s.id === saved)) {
+        setCurrentSceneId(saved);
+      }
+    } catch {}
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Persist selected scene
+  useEffect(() => {
+    try {
+      if (currentSceneId)
+        localStorage.setItem("soundboard.currentSceneId", currentSceneId);
+    } catch {}
+  }, [currentSceneId]);
+
+  // Persist show to localStorage on every change
+  useEffect(() => {
+    try {
+      const payload = serializeShowForSave(show);
+      localStorage.setItem("soundboard.show.v1", JSON.stringify(payload));
+    } catch {}
+  }, [show]);
 
   // Apply Remember Mix on scene load if enabled
   useEffect(() => {
@@ -307,6 +340,34 @@ function App() {
       }
     };
   }, [quickUrl]);
+
+  // On initial load, try auto-relink using a previously saved directory handle.
+  // If not possible or not permitted, offer to relink manually once.
+  useEffect(() => {
+    (async () => {
+      if (attemptedAutoRelinkRef.current) return;
+      attemptedAutoRelinkRef.current = true;
+      const supported =
+        typeof window !== "undefined" && !!window.showDirectoryPicker;
+      let autoLinked = false;
+      if (supported) {
+        try {
+          autoLinked = await autoRelinkFromStoredHandle(
+            setShow,
+            setStatus,
+            show
+          );
+        } catch {}
+      }
+      const missing = countRelinkCandidates(show);
+      if (!autoLinked && missing > 0 && supported) {
+        setRelinkMissingCount(missing);
+        setRelinkRequired(true);
+        setStatus(`Missing ${missing} audio file(s) — click Relink Files`);
+      }
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // Keyboard shortcuts
   useEffect(() => {
@@ -712,6 +773,145 @@ function App() {
     }
   }
 
+  // --- Persistence: export/import & relink ---
+  function handleExport() {
+    try {
+      const data = serializeShowForSave(show);
+      const blob = new Blob([JSON.stringify(data, null, 2)], {
+        type: "application/json",
+      });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      const ts = new Date().toISOString().slice(0, 19).replace(/[.:T]/g, "-");
+      a.href = url;
+      a.download = `${(show.title || "soundboard").replace(
+        /\s+/g,
+        "_"
+      )}-${ts}.json`;
+      a.click();
+      setTimeout(() => {
+        try {
+          URL.revokeObjectURL(url);
+        } catch {}
+      }, 1000);
+      setStatus("Exported settings");
+    } catch {
+      setStatus("Export failed");
+    }
+  }
+
+  function handleImportFile(e) {
+    const f = e.target.files?.[0];
+    if (!f) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const obj = JSON.parse(reader.result);
+        const next = migrateLoadedShow(obj);
+        setShow(next);
+        setCurrentSceneId(next.scenes[0]?.id);
+        setStatus("Imported settings");
+      } catch {
+        setStatus("Invalid JSON import");
+      } finally {
+        try {
+          e.target.value = "";
+        } catch {}
+      }
+    };
+    try {
+      reader.readAsText(f);
+    } catch {
+      setStatus("Import failed");
+    }
+  }
+
+  async function relinkFromDirectory() {
+    if (typeof window === "undefined" || !window.showDirectoryPicker) {
+      try {
+        alert(
+          "Folder picker not supported in this browser. Use Edit to reattach files."
+        );
+      } catch {}
+      return;
+    }
+    try {
+      const dir = await window.showDirectoryPicker({});
+      // Try to persist storage and remember handle for future auto-relink
+      try {
+        await navigator.storage?.persist?.();
+      } catch {}
+      try {
+        await saveRootDirectoryHandle(dir);
+      } catch {}
+      setStatus("Indexing folder...");
+      const index = await indexDirectoryFiles(dir);
+      const needed = [];
+      (show.scenes || []).forEach((scene) => {
+        ["background", "ambients", "sfx"].forEach((gk) => {
+          (scene[gk] || []).forEach((p) => {
+            const name = fileNameFromPath(p.assetPath || "");
+            if (!name || isUrlLike(name) || p.assetUrl) return;
+            needed.push(name.toLowerCase());
+          });
+        });
+      });
+      const unique = Array.from(new Set(needed));
+      const nameToUrl = new Map();
+      let created = 0;
+      for (const name of unique) {
+        const handle = index.get(name);
+        if (!handle) continue;
+        try {
+          const file = await handle.getFile();
+          const url = URL.createObjectURL(file);
+          nameToUrl.set(name, url);
+          created++;
+        } catch {}
+      }
+      let linked = 0;
+      setShow((prev) => {
+        const next = structuredClone(prev);
+        (next.scenes || []).forEach((scene) => {
+          ["background", "ambients", "sfx"].forEach((gk) => {
+            (scene[gk] || []).forEach((p) => {
+              const key = fileNameFromPath(p.assetPath || "");
+              const url = nameToUrl.get(key);
+              if (url) {
+                p.assetUrl = url;
+                linked++;
+              }
+            });
+          });
+        });
+        return next;
+      });
+      setStatus(`Relinked ${linked}/${unique.length} file(s)`);
+      // Close the modal after an attempt (user selected a folder)
+      setRelinkRequired(false);
+      setRelinkMissingCount(0);
+    } catch {
+      // user cancelled or error
+    }
+  }
+
+  async function indexDirectoryFiles(dirHandle) {
+    const map = new Map();
+    async function walk(dh) {
+      try {
+        for await (const [name, handle] of dh.entries()) {
+          if (handle && handle.kind === "file") {
+            map.set(name.toLowerCase(), handle);
+          } else if (handle && handle.kind === "directory") {
+            await walk(handle);
+          }
+        }
+      } catch {}
+    }
+    await walk(dirHandle);
+    return map;
+  }
+
   return (
     <div className="app">
       <aside className="sidebar">
@@ -847,6 +1047,18 @@ function App() {
           <button className="btn" onClick={() => setMapperOpen(true)}>
             APC Mapper
           </button>
+          <button className="btn" onClick={handleExport}>
+            Export
+          </button>
+          <button
+            className="btn"
+            onClick={() => importInputRef.current?.click()}
+          >
+            Import
+          </button>
+          <button className="btn" onClick={relinkFromDirectory}>
+            Relink Files
+          </button>
           <div className="spacer" />
           <span id="status">{status}</span>
           <span style={{ marginLeft: 10, color: "#bbb", fontSize: 12 }}>
@@ -930,6 +1142,14 @@ function App() {
           <div>MIDI: {midiOut ? midiOut.name : "Offline"}</div>
         </div>
       </div>
+      {/* Hidden import input */}
+      <input
+        type="file"
+        accept="application/json"
+        ref={importInputRef}
+        onChange={handleImportFile}
+        style={{ display: "none" }}
+      />
       {mode === "edit" && (
         <div
           style={{ position: "absolute", left: 0, bottom: 0, padding: 12 }}
@@ -937,6 +1157,13 @@ function App() {
       )}
       {settingsOpen && <SettingsModal onClose={() => setSettingsOpen(false)} />}
       {mapperOpen && <ApcMapperModal onClose={() => setMapperOpen(false)} />}
+      {relinkRequired && (
+        <RelinkModal
+          missingCount={relinkMissingCount}
+          onRelink={relinkFromDirectory}
+          onClose={() => setRelinkRequired(false)}
+        />
+      )}
       {editor.open && (
         <SoundEditorDrawer
           editor={editor}
@@ -1538,6 +1765,62 @@ function Legend({ onClose }) {
   );
 }
 
+function RelinkModal({ missingCount, onRelink, onClose }) {
+  return (
+    <div className="modalBackdrop" onClick={onClose}>
+      <div
+        className="modal"
+        onClick={(e) => e.stopPropagation()}
+        style={{ maxWidth: 560, minHeight: 320 }}
+      >
+        <div className="modalHeader" style={{ borderBottom: "none" }}>
+          <div style={{ fontWeight: 700, fontSize: 18 }}>
+            Relink Audio Files
+          </div>
+          <button className="btn sm" onClick={onClose}>
+            Close
+          </button>
+        </div>
+        <div className="modalBody" style={{ display: "flex", gap: 18 }}>
+          <div
+            style={{
+              fontSize: 64,
+              lineHeight: 1,
+              color: "#03dac6",
+              filter: "drop-shadow(0 0 10px rgba(3,218,198,0.25))",
+            }}
+            aria-hidden
+          >
+            🎵
+          </div>
+          <div style={{ flex: 1 }}>
+            <div style={{ color: "#ddd", fontSize: 16, marginBottom: 8 }}>
+              {`We couldn't find ${missingCount} audio file(s).`}
+            </div>
+            <div style={{ color: "#bbb", lineHeight: 1.7 }}>
+              Select the folder that contains your audio files. We'll
+              automatically reconnect them by filename. This works best in
+              Chrome or Edge.
+            </div>
+            <div style={{ marginTop: 12, color: "#8fd", fontSize: 12 }}>
+              Tip: Keep filenames consistent across machines for seamless
+              relinking.
+            </div>
+          </div>
+        </div>
+        <div className="modalFooter">
+          <button className="btn" onClick={onClose}>
+            Not now
+          </button>
+          <button className="btn blue" onClick={onRelink}>
+            Relink Now
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // Utilities and data
 function createInitialShow() {
   const opening = {
@@ -1846,6 +2129,197 @@ function apcOffClipLed(midiOut, note /*0..39*/, channel = 0) {
 // Map current React scene to APC LEDs
 function useApcSceneMapper(currentScene, midiOut, apcInitedRef) {
   // not a React hook in file bottom, but used via applySceneToAPC call sites
+}
+
+// --- Persistence helpers ---
+function serializeShowForSave(show) {
+  const safe = structuredClone(show || {});
+  // Strip ephemeral object URLs (blob:) so imports are portable across sessions
+  (safe.scenes || []).forEach((scene) => {
+    ["background", "ambients", "sfx"].forEach((gk) => {
+      (scene[gk] || []).forEach((p) => {
+        if (typeof p.assetUrl === "string" && p.assetUrl.startsWith("blob:")) {
+          delete p.assetUrl;
+        }
+      });
+    });
+  });
+  return {
+    version: 1,
+    savedAt: new Date().toISOString(),
+    show: safe,
+  };
+}
+
+function loadSavedShow() {
+  try {
+    const raw = localStorage.getItem("soundboard.show.v1");
+    if (!raw) return null;
+    const obj = JSON.parse(raw);
+    return migrateLoadedShow(obj);
+  } catch {
+    return null;
+  }
+}
+
+function migrateLoadedShow(obj) {
+  if (!obj) return createInitialShow();
+  // Support both wrapped {version, show} and raw show objects
+  const data = obj.show ? obj.show : obj;
+  // Basic shape checks
+  if (!data || !Array.isArray(data.scenes)) return createInitialShow();
+  // Ensure required arrays/fields exist
+  (data.scenes || []).forEach((scene) => {
+    scene.background = Array.isArray(scene.background) ? scene.background : [];
+    scene.ambients = Array.isArray(scene.ambients) ? scene.ambients : [];
+    scene.sfx = Array.isArray(scene.sfx) ? scene.sfx : [];
+  });
+  data.groups = Array.isArray(data.groups) ? data.groups : [];
+  data.settings = data.settings || { theme: "dark" };
+  return data;
+}
+
+function isUrlLike(path) {
+  return /^(https?:|blob:|tauri:)/.test(path || "");
+}
+
+function countRelinkCandidates(show) {
+  let n = 0;
+  try {
+    (show.scenes || []).forEach((scene) => {
+      ["background", "ambients", "sfx"].forEach((gk) => {
+        (scene[gk] || []).forEach((p) => {
+          const name = fileNameFromPath(p.assetPath || "");
+          if (!name) return;
+          if (isUrlLike(name) || p.assetUrl) return;
+          n++;
+        });
+      });
+    });
+  } catch {}
+  return n;
+}
+
+function fileNameFromPath(pathLike) {
+  if (!pathLike) return "";
+  const s = String(pathLike);
+  const idx = Math.max(s.lastIndexOf("/"), s.lastIndexOf("\\"));
+  return (idx >= 0 ? s.slice(idx + 1) : s).toLowerCase();
+}
+
+// Attempt to re-link using a previously saved directory handle from IndexedDB
+async function autoRelinkFromStoredHandle(setShow, setStatus, show) {
+  try {
+    const dir = await loadRootDirectoryHandle();
+    if (!dir) return false;
+    let perm = "granted";
+    try {
+      if (typeof dir.queryPermission === "function") {
+        perm = await dir.queryPermission({ mode: "read" });
+      }
+    } catch {}
+    if (perm !== "granted") return false;
+    setStatus && setStatus("Re-linking from saved folder...");
+    const index = await indexDirectoryFiles(dir);
+    const needed = new Set();
+    (show.scenes || []).forEach((scene) => {
+      ["background", "ambients", "sfx"].forEach((gk) => {
+        (scene[gk] || []).forEach((p) => {
+          const name = fileNameFromPath(p.assetPath || "");
+          if (!name || isUrlLike(name) || p.assetUrl) return;
+          needed.add(name);
+        });
+      });
+    });
+    if (needed.size === 0) return false;
+    const nameToUrl = new Map();
+    for (const name of needed) {
+      const handle = index.get(name);
+      if (!handle) continue;
+      try {
+        const file = await handle.getFile();
+        const url = URL.createObjectURL(file);
+        nameToUrl.set(name, url);
+      } catch {}
+    }
+    let linked = 0;
+    setShow((prev) => {
+      const next = structuredClone(prev);
+      (next.scenes || []).forEach((scene) => {
+        ["background", "ambients", "sfx"].forEach((gk) => {
+          (scene[gk] || []).forEach((p) => {
+            const key = fileNameFromPath(p.assetPath || "");
+            const url = nameToUrl.get(key);
+            if (url) {
+              p.assetUrl = url;
+              linked++;
+            }
+          });
+        });
+      });
+      return next;
+    });
+    if (linked > 0) setStatus && setStatus(`Auto-relinked ${linked} file(s)`);
+    return linked > 0;
+  } catch {
+    return false;
+  }
+}
+
+// IDB helpers to save/load a directory handle
+function openIdb() {
+  return new Promise((resolve, reject) => {
+    try {
+      const req = indexedDB.open("soundboard-db", 1);
+      req.onupgradeneeded = () => {
+        try {
+          const db = req.result;
+          if (!db.objectStoreNames.contains("handles")) {
+            db.createObjectStore("handles");
+          }
+        } catch {}
+      };
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    } catch (e) {
+      reject(e);
+    }
+  });
+}
+
+async function saveRootDirectoryHandle(handle) {
+  try {
+    const db = await openIdb();
+    await new Promise((resolve, reject) => {
+      const tx = db.transaction("handles", "readwrite");
+      const store = tx.objectStore("handles");
+      const req = store.put(handle, "rootDir");
+      req.onsuccess = () => resolve();
+      req.onerror = () => reject(req.error);
+    });
+    try {
+      db.close();
+    } catch {}
+  } catch {}
+}
+
+async function loadRootDirectoryHandle() {
+  try {
+    const db = await openIdb();
+    const handle = await new Promise((resolve, reject) => {
+      const tx = db.transaction("handles", "readonly");
+      const store = tx.objectStore("handles");
+      const req = store.get("rootDir");
+      req.onsuccess = () => resolve(req.result || null);
+      req.onerror = () => reject(req.error);
+    });
+    try {
+      db.close();
+    } catch {}
+    return handle || null;
+  } catch {
+    return null;
+  }
 }
 
 function SettingsModal({ onClose }) {
