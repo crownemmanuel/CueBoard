@@ -1,5 +1,61 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import WaveSurfer from "wavesurfer.js";
 import "./App.css";
+
+// APC40 mkII restricted color palette and helpers
+const APC_COLOR_TABLE = [
+  { name: "White", vel: 3, hex: "#FFFFFF" },
+  { name: "Red", vel: 5, hex: "#FF0000" },
+  { name: "Deep Red", vel: 106, hex: "#A00000" },
+  { name: "Orange", vel: 9, hex: "#FF6A00" },
+  { name: "Orange 2", vel: 96, hex: "#FF7F24" },
+  { name: "Yellow", vel: 13, hex: "#FFFF00" },
+  { name: "Bright Yellow", vel: 109, hex: "#FFFF66" },
+  { name: "Green", vel: 21, hex: "#00FF00" },
+  { name: "Bright Green", vel: 98, hex: "#00FF66" },
+  { name: "Cyan", vel: 37, hex: "#00A9FF" },
+  { name: "Aqua", vel: 90, hex: "#00FFFF" },
+  { name: "Blue", vel: 45, hex: "#0000FF" },
+  { name: "Light Blue", vel: 91, hex: "#66B2FF" },
+  { name: "Purple", vel: 49, hex: "#5A00FF" },
+  { name: "Magenta", vel: 53, hex: "#FF00FF" },
+  { name: "Bright Magenta", vel: 94, hex: "#FF66FF" },
+];
+
+const APC_HEX_TO_VEL = Object.fromEntries(
+  APC_COLOR_TABLE.map((c) => [c.hex.toUpperCase(), c.vel])
+);
+const APC_NAME_TO_VEL = Object.fromEntries(
+  APC_COLOR_TABLE.map((c) => [c.name, c.vel])
+);
+const APC_VEL_TO_HEX = Object.fromEntries(
+  APC_COLOR_TABLE.map((c) => [c.vel, c.hex])
+);
+
+// Physical grid ordering (top to bottom rows)
+const APC_ROWS = [
+  [33, 34, 35, 36, 37, 38, 39, 40],
+  [25, 26, 27, 28, 29, 30, 31, 32],
+  [17, 18, 19, 20, 21, 22, 23, 24],
+  [9, 10, 11, 12, 13, 14, 15, 16],
+  [1, 2, 3, 4, 5, 6, 7, 8],
+];
+
+function apcVelFromHex(hex) {
+  if (!hex) return APC_NAME_TO_VEL.Green || 21;
+  const key = hex.toUpperCase();
+  return APC_HEX_TO_VEL[key] ?? 21;
+}
+
+function chooseDefaultOutput(access, preferId) {
+  if (!access) return null;
+  const outs = Array.from(access.outputs.values());
+  let pick = null;
+  if (preferId) pick = outs.find((o) => o.id === preferId) || null;
+  if (!pick) pick = outs.find((o) => /APC|Akai/i.test(o.name)) || null;
+  if (!pick) pick = outs[0] || null;
+  return pick;
+}
 
 function App() {
   const [mode, setMode] = useState("show"); // "show" | "edit"
@@ -15,6 +71,21 @@ function App() {
     groupKey: null,
     padId: null,
   });
+  const [mapperOpen, setMapperOpen] = useState(false);
+
+  // Web MIDI state for APC LED control
+  const [midiAccess, setMidiAccess] = useState(null);
+  const [midiOut, setMidiOut] = useState(null);
+  const [midiOutName, setMidiOutName] = useState("Offline");
+  const apcInitedRef = useRef(false);
+  const audioCtxRef = useRef(null);
+  const padAudioRef = useRef(new Map());
+  const apcNoteToPadRef = useRef(new Map());
+  const apcInMapRef = useRef(null); // Map<incomingNote:number, padNumber:number>
+  // Quick HTML5 test player (Show mode)
+  const [quickUrl, setQuickUrl] = useState("");
+  const [quickName, setQuickName] = useState("");
+  const quickAudioRef = useRef(null);
 
   const currentScene = useMemo(() => {
     return show.scenes.find((s) => s.id === currentSceneId) || show.scenes[0];
@@ -45,6 +116,115 @@ function App() {
     setSelectedPadKey(null);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [currentSceneId]);
+
+  // Initialize Web MIDI (with SysEx so we can init APC40)
+  useEffect(() => {
+    // Load saved APC input note mapping (if any)
+    try {
+      const raw = localStorage.getItem("apcInNoteMap");
+      if (raw) {
+        const obj = JSON.parse(raw);
+        const m = new Map();
+        Object.entries(obj).forEach(([k, v]) => m.set(Number(k), Number(v)));
+        apcInMapRef.current = m;
+      }
+    } catch {}
+    const supported =
+      typeof navigator !== "undefined" && "requestMIDIAccess" in navigator;
+    if (!supported) {
+      setMidiAccess(null);
+      setMidiOut(null);
+      setMidiOutName("Not supported");
+      return;
+    }
+    let mounted = true;
+    function attachMidiInputHandlers(access) {
+      access.inputs.forEach((inp) => {
+        try {
+          inp.onmidimessage = (e) => {
+            const [status, d1, d2] = e.data;
+            // Note On with velocity > 0
+            if ((status & 0xf0) === 0x90 && d2 > 0) {
+              const note = d1 | 0; // 0..127
+              // Map APC clip grid
+              const padNumber = apcNoteToPadNumber(note);
+              if (padNumber) handleApcPadPress(padNumber - 1);
+            }
+          };
+        } catch {}
+      });
+    }
+
+    function apcNoteToPadNumber(note) {
+      // 1) User-provided mapping captured in Mapper modal
+      const user = apcInMapRef.current;
+      if (user && user.has(note)) return user.get(note);
+      // 2) Dynamic mapping from last LED layout
+      const memo = apcNoteToPadRef.current;
+      if (memo && memo.has(note)) return memo.get(note);
+      // 3) Heuristic fallback
+      if (note >= 0 && note < 40) return note + 1;
+      // Unknown mapping: log once to console and ignore
+      try {
+        if (typeof window !== "undefined")
+          console.debug && console.debug("Unmapped APC note", note);
+      } catch {}
+      return null;
+    }
+
+    navigator
+      .requestMIDIAccess({ sysex: true })
+      .then((access) => {
+        if (!mounted) return;
+        setMidiAccess(access);
+        const out = chooseDefaultOutput(access);
+        setMidiOut(out);
+        setMidiOutName(out ? out.name : "Offline");
+        apcInitedRef.current = false;
+        // Attach handlers for current inputs
+        attachMidiInputHandlers(access);
+        access.onstatechange = () => {
+          const next = chooseDefaultOutput(access, out?.id);
+          setMidiOut(next);
+          setMidiOutName(next ? next.name : "Offline");
+          apcInitedRef.current = false;
+          // Re-attach input handlers on device changes
+          attachMidiInputHandlers(access);
+        };
+      })
+      .catch(() => {
+        if (!mounted) return;
+        setMidiAccess(null);
+        setMidiOut(null);
+        setMidiOutName("Permission blocked");
+      });
+    return () => {
+      mounted = false;
+    };
+  }, []);
+
+  // Reapply LEDs when scene or MIDI output changes
+  useEffect(() => {
+    applySceneToAPC(currentScene);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentSceneId, midiOut]);
+
+  // If group colors change, re-light current scene to reflect updates
+  useEffect(() => {
+    applySceneToAPC(currentScene);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [show.groups]);
+
+  // Revoke previous blob when quickUrl changes
+  useEffect(() => {
+    return () => {
+      if (quickUrl && quickUrl.startsWith("blob:")) {
+        try {
+          URL.revokeObjectURL(quickUrl);
+        } catch {}
+      }
+    };
+  }, [quickUrl]);
 
   // Keyboard shortcuts
   useEffect(() => {
@@ -82,10 +262,14 @@ function App() {
     updateScene((scene) => {
       const pad = findPad(scene, group, id);
       if (!pad) return scene;
-      pad.playing = !pad.playing;
-      setStatus(
-        `${pad.label || pad.name} ${pad.playing ? "started" : "stopped"}`
-      );
+      if (!pad.assetUrl && !pad.assetPath) {
+        setStatus("No audio attached to this pad");
+        return scene;
+      }
+      const next = !pad.playing;
+      pad.playing = next;
+      handlePadAudio(scene, group, pad, next);
+      setStatus(`${pad.label || pad.name} ${next ? "started" : "stopped"}`);
       return scene;
     });
   }
@@ -96,6 +280,8 @@ function App() {
       return scene;
     });
     setStatus("Stop all");
+    clearAllApcLeds();
+    stopAllAudio();
   }
 
   function handleFadeAll() {
@@ -131,6 +317,8 @@ function App() {
       return scene;
     });
     setStatus("PANIC executed");
+    clearAllApcLeds();
+    stopAllAudio();
   }
 
   function handleRememberCapture() {
@@ -163,6 +351,214 @@ function App() {
     const idx = show.scenes.findIndex((s) => s.id === currentSceneId);
     const next = show.scenes[(idx + 1) % show.scenes.length];
     setCurrentSceneId(next.id);
+  }
+
+  // --- APC mapping & LED helpers (component-scoped, use midiOut) ---
+  function initApcIfNeeded() {
+    if (!midiOut || apcInitedRef.current) return;
+    try {
+      midiOut.send(apcInitSysexMsg());
+      apcInitedRef.current = true;
+      setStatus((s) => `${s} — APC inited`);
+    } catch {}
+  }
+
+  function clearAllApcLeds(channel = 0) {
+    if (!midiOut) return;
+    for (let n = 0; n < 40; n++) {
+      apcOffClipLed(midiOut, n, channel);
+    }
+  }
+
+  function applySceneToAPC(scene) {
+    if (!scene || !midiOut) return;
+    initApcIfNeeded();
+    // Clear first to avoid stale LEDs
+    clearAllApcLeds(0);
+    try {
+      apcNoteToPadRef.current = new Map();
+    } catch {}
+
+    // Map: background -> top row; ambients -> second row; sfx -> third row
+    const groupHex = (gid) =>
+      (show.groups || []).find((g) => g.id === gid)?.color;
+
+    const mapGroupToRow = (pads, rowIndex) => {
+      const row = APC_ROWS[rowIndex];
+      if (!row) return;
+      pads.forEach((p, i) => {
+        if (!row[i]) return; // ignore overflow
+        const hex = (p.color || groupHex(p.groupId) || "#00FF00").toUpperCase();
+        const vel = apcVelFromHex(hex);
+        const note = row[i] - 1; // 0..39
+        try {
+          apcNoteToPadRef.current.set(note, row[i]);
+        } catch {}
+        apcSendClipLed(midiOut, note, vel, 0);
+      });
+    };
+
+    mapGroupToRow(scene.background || [], 0); // 33..40
+    mapGroupToRow(scene.ambients || [], 1); // 25..32
+    mapGroupToRow(scene.sfx || [], 2); // 17..24
+  }
+
+  function handleApcPadPress(note /*0..39*/) {
+    // Map incoming APC note back to group/pad index by our scene mapping
+    const padNumber = note + 1; // 1..40
+    // Determine row and col
+    const rowIdx = APC_ROWS.findIndex((row) => row.includes(padNumber));
+    if (rowIdx < 0) return;
+    const colIdx = APC_ROWS[rowIdx].indexOf(padNumber);
+    if (rowIdx === 0) {
+      const p = currentScene.background[colIdx];
+      if (p) togglePadPlay("background", p.id);
+    } else if (rowIdx === 1) {
+      const p = currentScene.ambients[colIdx];
+      if (p) togglePadPlay("ambients", p.id);
+    } else if (rowIdx === 2) {
+      const p = currentScene.sfx[colIdx];
+      if (p) togglePadPlay("sfx", p.id);
+    }
+  }
+
+  // --- Audio engine ---
+  function ensureAudioContext() {
+    if (!audioCtxRef.current) {
+      // eslint-disable-next-line no-undef
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC) return null;
+      audioCtxRef.current = new AC();
+    }
+    try {
+      if (audioCtxRef.current.state === "suspended") {
+        // Resume on user gesture (play button click)
+        audioCtxRef.current.resume();
+      }
+    } catch {}
+    return audioCtxRef.current;
+  }
+
+  function padKey(sceneId, groupKey, padId) {
+    return `${sceneId}:${groupKey}:${padId}`;
+  }
+
+  function handlePadAudio(scene, groupKey, pad, shouldPlay) {
+    if (!pad.assetUrl && !pad.assetPath) return;
+    if (shouldPlay) {
+      playPad(scene.id, groupKey, pad);
+      runPadTriggers(scene, pad, "onStart");
+    } else {
+      stopPad(scene.id, groupKey, pad.id);
+      runPadTriggers(scene, pad, "onStop");
+    }
+  }
+
+  function playPad(sceneId, groupKey, pad) {
+    const ctx = ensureAudioContext();
+    if (!ctx) return;
+    const key = padKey(sceneId, groupKey, pad.id);
+    stopPad(sceneId, groupKey, pad.id);
+    const srcUrl =
+      pad.assetUrl ||
+      (/^(https?:|blob:|tauri:)/.test(pad.assetPath || "")
+        ? pad.assetPath
+        : null);
+    if (!srcUrl) {
+      setStatus(
+        "Local file path cannot be played directly. Use the file chooser."
+      );
+      return;
+    }
+    const el = new Audio(srcUrl);
+    el.crossOrigin = "anonymous";
+    el.loop = pad.playbackMode === "loop";
+    const source = ctx.createMediaElementSource(el);
+    const gain = ctx.createGain();
+    gain.gain.value = clamp01(pad.level ?? 0.8);
+    source.connect(gain).connect(ctx.destination);
+    padAudioRef.current.set(key, { el, gain });
+    el.onended = () => {
+      if (!el.loop) {
+        // Reflect stopped state in UI
+        setShow((prev) => ({
+          ...prev,
+          scenes: prev.scenes.map((s) => {
+            if (s.id !== sceneId) return s;
+            const sc = structuredClone(s);
+            const arr = groupArray(sc, groupKey);
+            const p = arr.find((x) => x.id === pad.id);
+            if (p) p.playing = false;
+            return sc;
+          }),
+        }));
+      }
+    };
+    el.onerror = () => {
+      setStatus("Could not play this audio file");
+    };
+    try {
+      const p = el.play();
+      if (p && typeof p.then === "function")
+        p.catch(() => setStatus("Playback was blocked"));
+    } catch {
+      setStatus("Playback error");
+    }
+  }
+
+  function stopPad(sceneId, groupKey, padId) {
+    const key = padKey(sceneId, groupKey, padId);
+    const ref = padAudioRef.current.get(key);
+    if (!ref) return;
+    try {
+      ref.el.pause();
+      ref.el.currentTime = 0;
+    } catch {}
+    try {
+      ref.gain.disconnect();
+    } catch {}
+    padAudioRef.current.delete(key);
+  }
+
+  function applyPadVolume(sceneId, groupKey, padId, level) {
+    const key = padKey(sceneId, groupKey, padId);
+    const ref = padAudioRef.current.get(key);
+    if (!ref) return;
+    ref.gain.gain.value = clamp01(level);
+  }
+
+  function runPadTriggers(scene, pad, phase) {
+    const t = pad.triggers?.[phase];
+    if (!t || t.action === "none") return;
+    const parts = (t.target || "").split(":");
+    const targetScene = scene;
+    const doFade = (p, ms, db) => {
+      const id = p.id;
+      const groupKey = p.groupKey || inferGroupKey(targetScene, id);
+      if (!groupKey) return;
+      const from = p.level ?? 0.8;
+      const to = clamp01(dbToLinear(linearToDb(from) + (db || -12)));
+      const steps = Math.max(1, Math.floor((ms || 200) / 16));
+      let i = 0;
+      const tick = () => {
+        const v = from + (to - from) * (i / steps);
+        setPadLevel(groupKey, id, v);
+        i++;
+        if (i <= steps) requestAnimationFrame(tick);
+      };
+      tick();
+    };
+    if (t.targetType === "pad" && parts.length >= 1) {
+      const pid = parts[0] || pad.id;
+      const [gk, p] = findPadByAny(targetScene, pid) || [];
+      if (!p || !gk) return;
+      if (t.action === "play") togglePadPlay(gk, p.id);
+      else if (t.action === "stop") {
+        if (p.playing) togglePadPlay(gk, p.id);
+      } else if (t.action === "fade") {
+        doFade(p, t.timeMs, t.amountDb);
+      }
+    }
   }
 
   return (
@@ -216,13 +612,29 @@ function App() {
                       updateGroup(g.id, { name: e.target.value })
                     }
                   />
-                  <input
-                    type="color"
+                  <select
                     value={g.color}
                     onChange={(e) =>
                       updateGroup(g.id, { color: e.target.value })
                     }
-                  />
+                    style={{
+                      background: g.color,
+                      color: getReadableTextColor(g.color),
+                    }}
+                  >
+                    {APC_COLOR_TABLE.map((c) => (
+                      <option
+                        key={c.vel}
+                        value={c.hex}
+                        style={{
+                          background: c.hex,
+                          color: getReadableTextColor(c.hex),
+                        }}
+                      >
+                        {c.name}
+                      </option>
+                    ))}
+                  </select>
                   <div className="groupActions">
                     <button
                       className="btn sm"
@@ -281,8 +693,14 @@ function App() {
           <button className="btn" onClick={() => setSettingsOpen(true)}>
             Settings
           </button>
+          <button className="btn" onClick={() => setMapperOpen(true)}>
+            APC Mapper
+          </button>
           <div className="spacer" />
           <span id="status">{status}</span>
+          <span style={{ marginLeft: 10, color: "#bbb", fontSize: 12 }}>
+            MIDI: {midiOutName}
+          </span>
         </div>
 
         <div className="content">
@@ -290,11 +708,14 @@ function App() {
 
           <GroupSection
             title="Background Music"
-            color="#2d6cdf"
+            color={groupColors["grp-bg"] || "#0000FF"}
             pads={currentScene.background}
             groupKey="background"
             mode={mode}
             onPadToggle={(id) => togglePadPlay("background", id)}
+            onSetPlaying={(id, playing) =>
+              setPadPlaying("background", id, playing)
+            }
             onLevelChange={(id, v) => setPadLevel("background", id, v)}
             onEdit={(id) => openEditor("background", id)}
             onDelete={(id) => deletePad("background", id)}
@@ -304,11 +725,14 @@ function App() {
 
           <GroupSection
             title="Ambient Noise"
-            color="#f2b84b"
+            color={groupColors["grp-amb"] || "#FF6A00"}
             pads={currentScene.ambients}
             groupKey="ambients"
             mode={mode}
             onPadToggle={(id) => togglePadPlay("ambients", id)}
+            onSetPlaying={(id, playing) =>
+              setPadPlaying("ambients", id, playing)
+            }
             onLevelChange={(id, v) => setPadLevel("ambients", id, v)}
             onEdit={(id) => openEditor("ambients", id)}
             onDelete={(id) => deletePad("ambients", id)}
@@ -318,11 +742,12 @@ function App() {
 
           <GroupSection
             title="Sound Effects"
-            color="#4caf50"
+            color={groupColors["grp-sfx"] || "#00FF00"}
             pads={currentScene.sfx}
             groupKey="sfx"
             mode={mode}
             onPadToggle={(id) => togglePadPlay("sfx", id)}
+            onSetPlaying={(id, playing) => setPadPlaying("sfx", id, playing)}
             onLevelChange={(id, v) => setPadLevel("sfx", id, v)}
             onEdit={(id) => openEditor("sfx", id)}
             onDelete={(id) => deletePad("sfx", id)}
@@ -348,7 +773,7 @@ function App() {
           <div>
             Soundboard — {mode.toUpperCase()} — Scene: {currentScene.name}
           </div>
-          <div>MIDI: Offline</div>
+          <div>MIDI: {midiOut ? midiOut.name : "Offline"}</div>
         </div>
       </div>
       {mode === "edit" && (
@@ -357,6 +782,7 @@ function App() {
         />
       )}
       {settingsOpen && <SettingsModal onClose={() => setSettingsOpen(false)} />}
+      {mapperOpen && <ApcMapperModal onClose={() => setMapperOpen(false)} />}
       {editor.open && (
         <SoundEditorDrawer
           editor={editor}
@@ -375,6 +801,10 @@ function App() {
     updateScene((scene) => {
       const pad = findPad(scene, groupKey, id);
       if (!pad) return scene;
+      if (!pad.assetUrl && !pad.assetPath) {
+        setStatus("No audio attached to this pad");
+        return scene;
+      }
       pad.playing = !pad.playing;
       setStatus(
         `${pad.label || pad.name} ${pad.playing ? "started" : "stopped"}`
@@ -388,7 +818,17 @@ function App() {
       const pad = findPad(scene, groupKey, id);
       if (!pad) return scene;
       pad.level = value;
+      applyPadVolume(currentScene.id, groupKey, id, value);
       setStatus(`${pad.label || pad.name} level ${(value * 100) | 0}%`);
+      return scene;
+    });
+  }
+
+  function setPadPlaying(groupKey, id, playing) {
+    updateScene((scene) => {
+      const pad = findPad(scene, groupKey, id);
+      if (!pad) return scene;
+      pad.playing = !!playing;
       return scene;
     });
   }
@@ -528,6 +968,7 @@ function GroupSection({
   groupKey,
   mode,
   onPadToggle,
+  onSetPlaying,
   onLevelChange,
   onEdit,
   onDelete,
@@ -548,6 +989,7 @@ function GroupSection({
             groupKey={groupKey}
             mode={mode}
             onToggle={() => onPadToggle(p.id)}
+            onSetPlaying={(playing) => onSetPlaying?.(p.id, playing)}
             onLevelChange={(v) => onLevelChange(p.id, v)}
             selected={selectedPadKey === `${groupKey}:${p.id}`}
             onSelect={() => setSelectedPadKey(`${groupKey}:${p.id}`)}
@@ -570,16 +1012,120 @@ function PadCard({
   groupKey,
   mode,
   onToggle,
+  onSetPlaying,
   onLevelChange,
   selected,
   onSelect,
   onEdit,
   onDelete,
 }) {
-  const levelPercent = Math.max(6, Math.floor((pad.level || 0) * 100));
   const headerStyle = { background: "rgba(0,0,0,.18)", color: "#fff" };
   const resolvedBase = pad.color || "#2a2a2a";
   const bodyColor = pad.playing ? lighten(resolvedBase, 0.12) : resolvedBase;
+
+  const waveRef = useRef(null);
+  const wsRef = useRef(null);
+
+  useEffect(() => {
+    if (!waveRef.current || !(pad.assetUrl || pad.assetPath)) return;
+    if (wsRef.current) {
+      try {
+        wsRef.current.destroy();
+      } catch {}
+      wsRef.current = null;
+    }
+    wsRef.current = WaveSurfer.create({
+      container: waveRef.current,
+      waveColor: "#4fc3f7",
+      progressColor: "#03dac6",
+      cursorColor: "#eee",
+      height: 56,
+      barWidth: 2,
+      normalize: true,
+    });
+    wsRef.current.load(pad.assetUrl || pad.assetPath);
+    const onPlay = () => onSetPlaying?.(true);
+    const onPause = () => onSetPlaying?.(false);
+    const onFinish = () => {
+      if (pad.playbackMode === "loop") {
+        try {
+          wsRef.current?.play(0);
+        } catch {}
+      } else {
+        onPause();
+      }
+    };
+    wsRef.current.on("play", onPlay);
+    wsRef.current.on("pause", onPause);
+    wsRef.current.on("finish", onFinish);
+    return () => {
+      try {
+        wsRef.current?.un("play", onPlay);
+        wsRef.current?.un("pause", onPause);
+        wsRef.current?.un("finish", onFinish);
+        wsRef.current?.destroy();
+      } catch {}
+      wsRef.current = null;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pad.assetUrl, pad.assetPath, pad.playbackMode]);
+
+  // Sync external playing state (e.g., MIDI toggle) to WaveSurfer instance
+  useEffect(() => {
+    const ws = wsRef.current;
+    if (!ws) return;
+    try {
+      const isPlaying = typeof ws.isPlaying === "function" && ws.isPlaying();
+      if (pad.playing && !isPlaying) {
+        const target = pad.level || 0;
+        const fadeMs = typeof pad.fadeInMs === "number" ? pad.fadeInMs : 0;
+        if (fadeMs > 0) {
+          ws.setVolume?.(0);
+          ws.play?.();
+          const t0 = performance.now();
+          const step = (t) => {
+            const p = Math.min(1, (t - t0) / fadeMs);
+            const v = target * p;
+            try {
+              ws.setVolume?.(v);
+            } catch {}
+            if (p < 1) requestAnimationFrame(step);
+          };
+          requestAnimationFrame(step);
+        } else {
+          ws.setVolume?.(target);
+          ws.play?.();
+        }
+      } else if (!pad.playing && isPlaying) {
+        const startVol =
+          (typeof ws.getVolume === "function"
+            ? ws.getVolume()
+            : pad.level || 0) || 0;
+        const durationMs =
+          typeof pad.fadeOutMs === "number" ? pad.fadeOutMs : 500;
+        if (durationMs > 0) {
+          const t0 = performance.now();
+          const step = (t) => {
+            const p = Math.min(1, (t - t0) / durationMs);
+            const v = Math.max(0, startVol * (1 - p));
+            try {
+              ws.setVolume?.(v);
+            } catch {}
+            if (p < 1) requestAnimationFrame(step);
+            else {
+              try {
+                ws.pause?.();
+                ws.setVolume?.(startVol);
+              } catch {}
+            }
+          };
+          requestAnimationFrame(step);
+        } else {
+          ws.pause?.();
+        }
+      }
+    } catch {}
+  }, [pad.playing, pad.level, pad.fadeInMs, pad.fadeOutMs]);
 
   const handleContextMenu = (e) => {
     e.preventDefault();
@@ -629,69 +1175,97 @@ function PadCard({
       )}
       <div className="padBody">
         <div className="playArea">
-          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-            <div
-              className={"playButton" + (pad.playing ? " paused" : "")}
-              onClick={(e) => {
-                e.stopPropagation();
-                onToggle();
-              }}
-            />
-          </div>
-          <div className="meterBar">
-            <div className="meterFill" style={{ width: `${levelPercent}%` }} />
-          </div>
+          {pad.assetUrl || pad.assetPath ? (
+            <>
+              <div className="waveContainer" ref={waveRef} />
+              <div className="waveControls">
+                <button
+                  className="btn sm"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    try {
+                      const ws = wsRef.current;
+                      if (!ws) return;
+                      if (ws.isPlaying && ws.isPlaying()) {
+                        const startVol =
+                          (typeof ws.getVolume === "function"
+                            ? ws.getVolume()
+                            : pad.level || 0) || 0;
+                        const durationMs =
+                          typeof pad.fadeOutMs === "number"
+                            ? pad.fadeOutMs
+                            : 500;
+                        const t0 = performance.now();
+                        const step = (t) => {
+                          const p = Math.min(1, (t - t0) / durationMs);
+                          const v = Math.max(0, startVol * (1 - p));
+                          try {
+                            ws.setVolume?.(v);
+                          } catch {}
+                          if (p < 1) requestAnimationFrame(step);
+                          else {
+                            try {
+                              ws.pause?.();
+                              // restore for next play
+                              ws.setVolume?.(startVol);
+                            } catch {}
+                          }
+                        };
+                        requestAnimationFrame(step);
+                      } else {
+                        try {
+                          const target = pad.level || 0;
+                          const fadeMs =
+                            typeof pad.fadeInMs === "number" ? pad.fadeInMs : 0;
+                          if (fadeMs > 0) {
+                            ws.setVolume?.(0);
+                            ws.play?.();
+                            const t0 = performance.now();
+                            const step = (t) => {
+                              const p = Math.min(1, (t - t0) / fadeMs);
+                              const v = target * p;
+                              try {
+                                ws.setVolume?.(v);
+                              } catch {}
+                              if (p < 1) requestAnimationFrame(step);
+                            };
+                            requestAnimationFrame(step);
+                          } else {
+                            ws.setVolume?.(target);
+                            ws.play?.();
+                          }
+                        } catch {}
+                      }
+                    } catch {}
+                  }}
+                >
+                  {pad.playing ? "Pause" : "Play"}
+                </button>
+                <input
+                  type="range"
+                  min="0"
+                  max="1"
+                  step="0.01"
+                  value={pad.level || 0}
+                  onChange={(e) => {
+                    onLevelChange(Number(e.target.value));
+                    try {
+                      wsRef.current?.setVolume(Number(e.target.value));
+                    } catch {}
+                  }}
+                />
+              </div>
+            </>
+          ) : (
+            <div style={{ color: "#bbb" }}>No audio attached</div>
+          )}
         </div>
-        <VSlider value={pad.level || 0} onChange={onLevelChange} />
       </div>
     </div>
   );
 }
 
-function VSlider({ value, onChange }) {
-  const ref = useRef(null);
-  const KNOB_H = 14;
-  const HEIGHT = 80;
-  const [dragging, setDragging] = useState(false);
-
-  const valToY = (v) => (1 - v) * (HEIGHT - KNOB_H);
-  const yToVal = (y) => {
-    const clamped = Math.max(0, Math.min(HEIGHT - KNOB_H, y));
-    return 1 - clamped / (HEIGHT - KNOB_H);
-  };
-
-  useEffect(() => {
-    const onMove = (e) => {
-      if (!dragging) return;
-      const rect = ref.current.getBoundingClientRect();
-      const y = e.clientY - rect.top - KNOB_H / 2;
-      onChange?.(yToVal(y));
-    };
-    const onUp = () => setDragging(false);
-    window.addEventListener("mousemove", onMove);
-    window.addEventListener("mouseup", onUp);
-    return () => {
-      window.removeEventListener("mousemove", onMove);
-      window.removeEventListener("mouseup", onUp);
-    };
-  }, [dragging, onChange]);
-
-  return (
-    <div
-      ref={ref}
-      className="vSlider"
-      style={{ height: HEIGHT }}
-      onMouseDown={(e) => {
-        setDragging(true);
-        const rect = ref.current.getBoundingClientRect();
-        const y = e.clientY - rect.top - KNOB_H / 2;
-        onChange?.(yToVal(y));
-      }}
-    >
-      <div className="knob" style={{ top: valToY(value) }} />
-    </div>
-  );
-}
+// removed VSlider component
 
 function NotesPanel({ mode, notes, onChange }) {
   return (
@@ -748,7 +1322,7 @@ function createInitialShow() {
       {
         id: "bg1",
         name: "Background 1",
-        color: "#2d6cdf",
+        color: "#0000FF",
         groupId: "grp-bg",
         playbackMode: "loop",
         level: 0.75,
@@ -758,7 +1332,7 @@ function createInitialShow() {
       {
         id: "bg2",
         name: "Background 2",
-        color: "#2d6cdf",
+        color: "#0000FF",
         groupId: "grp-bg",
         playbackMode: "loop",
         level: 0.5,
@@ -770,7 +1344,7 @@ function createInitialShow() {
       {
         id: "amb1",
         name: "Market Crowd",
-        color: "#f2b84b",
+        color: "#FF6A00",
         groupId: "grp-amb",
         playbackMode: "loop",
         level: 0.6,
@@ -780,7 +1354,7 @@ function createInitialShow() {
       {
         id: "amb2",
         name: "Wind",
-        color: "#f2b84b",
+        color: "#FF6A00",
         groupId: "grp-amb",
         playbackMode: "loop",
         level: 0.4,
@@ -792,7 +1366,7 @@ function createInitialShow() {
       {
         id: "sfx1",
         name: "Crash",
-        color: "#e86f51",
+        color: "#FF0000",
         groupId: "grp-sfx",
         playbackMode: "once",
         level: 0.8,
@@ -802,7 +1376,7 @@ function createInitialShow() {
       {
         id: "sfx2",
         name: "Plate Break",
-        color: "#4caf50",
+        color: "#00FF00",
         groupId: "grp-sfx",
         playbackMode: "once",
         level: 0.7,
@@ -812,7 +1386,7 @@ function createInitialShow() {
       {
         id: "sfx3",
         name: "Door Slam",
-        color: "#4caf50",
+        color: "#00FF00",
         groupId: "grp-sfx",
         playbackMode: "once",
         level: 0.65,
@@ -869,9 +1443,9 @@ function createInitialShow() {
     title: "Production Name",
     scenes: [opening, scene2],
     groups: [
-      { id: "grp-bg", name: "Background", color: "#2d6cdf" },
-      { id: "grp-amb", name: "Ambient", color: "#f2b84b" },
-      { id: "grp-sfx", name: "Effects", color: "#4caf50" },
+      { id: "grp-bg", name: "Background", color: "#0000FF" },
+      { id: "grp-amb", name: "Ambient", color: "#FF6A00" },
+      { id: "grp-sfx", name: "Effects", color: "#00FF00" },
     ],
     routing: { buses: ["Master", "Stage", "Booth"], assignments: {} },
     settings: {
@@ -957,94 +1531,131 @@ function lighten(hex, amt) {
   return "#" + [r, g, b].map((v) => v.toString(16).padStart(2, "0")).join("");
 }
 
+function getReadableTextColor(hex) {
+  if (!hex) return "#000";
+  const c = hex.replace("#", "");
+  const r = parseInt(c.substring(0, 2), 16);
+  const g = parseInt(c.substring(2, 4), 16);
+  const b = parseInt(c.substring(4, 6), 16);
+  // Perceived luminance
+  const luminance = (0.299 * r + 0.587 * g + 0.114 * b) / 255;
+  return luminance > 0.6 ? "#111" : "#fff";
+}
+
+// Helpers to locate pads by id and infer their group
+function findPadByAny(scene, padId) {
+  const gk1 = "background";
+  const gk2 = "ambients";
+  const gk3 = "sfx";
+  const p1 = scene.background.find((p) => p.id === padId);
+  if (p1) return [gk1, p1];
+  const p2 = scene.ambients.find((p) => p.id === padId);
+  if (p2) return [gk2, p2];
+  const p3 = scene.sfx.find((p) => p.id === padId);
+  if (p3) return [gk3, p3];
+  return null;
+}
+
+function inferGroupKey(scene, padId) {
+  const found = findPadByAny(scene, padId);
+  return found ? found[0] : null;
+}
+
 export default App;
 
+// --- APC40 LED control helpers (Web MIDI) ---
+function apcInitSysexMsg(mode = 0x42) {
+  // 0x41 Live, 0x42 Alt Live; both enable host LED control
+  const verHigh = 1,
+    verLow = 0,
+    bugfix = 0;
+  return [
+    0xf0,
+    0x47,
+    0x7f,
+    0x29,
+    0x60,
+    0x00,
+    0x04,
+    mode,
+    verHigh,
+    verLow,
+    bugfix,
+    0xf7,
+  ];
+}
+
+function apcSendClipLed(
+  midiOut,
+  note /*0..39*/,
+  velocity /*palette idx*/,
+  channel = 0
+) {
+  if (!midiOut) return;
+  const status = 0x90 | (channel & 0x0f);
+  try {
+    midiOut.send([status, note & 0x7f, velocity & 0x7f]);
+  } catch {}
+}
+
+function apcOffClipLed(midiOut, note /*0..39*/, channel = 0) {
+  if (!midiOut) return;
+  const status = 0x80 | (channel & 0x0f);
+  try {
+    midiOut.send([status, note & 0x7f, 0]);
+  } catch {}
+}
+
+// Map current React scene to APC LEDs
+function useApcSceneMapper(currentScene, midiOut, apcInitedRef) {
+  // not a React hook in file bottom, but used via applySceneToAPC call sites
+}
+
 function SettingsModal({ onClose }) {
-  const [backend, setBackend] = useState("web");
   const [log, setLog] = useState([]);
-
-  // Native (Rust) state
-  const [inputs, setInputs] = useState([]);
-  const [outputs, setOutputs] = useState([]);
-  const [selectedIn, setSelectedIn] = useState(0);
-  const [selectedOut, setSelectedOut] = useState(0);
-
-  // Web MIDI state
   const [midiAccess, setMidiAccess] = useState(null);
   const [webInId, setWebInId] = useState("");
   const [webOutId, setWebOutId] = useState("");
   const [webSupported, setWebSupported] = useState(false);
   const webInputRef = useRef(null);
+  const [testUrl, setTestUrl] = useState("");
+  const [testName, setTestName] = useState("");
+  const [testMsg, setTestMsg] = useState("");
+  const audioRef = useRef(null);
 
   useEffect(() => {
-    if (backend === "native") {
-      window.__TAURI__?.core
-        ?.invoke("midi_refresh")
-        .then((snap) => {
-          setInputs(snap?.inputs || []);
-          setOutputs(snap?.outputs || []);
-        })
-        .catch(() => {
-          setInputs([]);
-          setOutputs([]);
-        });
-      const unlisten = window.__TAURI__?.event?.listen?.(
-        "midi://message",
-        (event) => {
-          setLog((l) => [event.payload, ...l].slice(0, 200));
-        }
-      );
-      return () => {
-        if (typeof unlisten === "function") unlisten();
-      };
-    } else {
-      const supported =
-        typeof navigator !== "undefined" && "requestMIDIAccess" in navigator;
-      setWebSupported(!!supported);
-      if (!supported) return;
-      navigator
-        .requestMIDIAccess({ sysex: false })
-        .then((a) => {
-          setMidiAccess(a);
-          const ins = Array.from(a.inputs.values());
-          const outs = Array.from(a.outputs.values());
-          setWebInId(ins[0]?.id || "");
-          setWebOutId(outs[0]?.id || "");
-          a.onstatechange = () => {
-            // force refresh
-            setWebInId((id) => id);
-            setWebOutId((id) => id);
-          };
-        })
-        .catch(() => setMidiAccess(null));
-      return () => {
-        if (webInputRef.current) {
-          try {
-            webInputRef.current.onmidimessage = null;
-          } catch {}
-          webInputRef.current = null;
-        }
-      };
-    }
-  }, [backend]);
-
-  function connectInNative() {
-    window.__TAURI__?.core?.invoke("midi_open_input", {
-      inputIndex: Number(selectedIn),
-    });
-  }
-  function sendTestNative() {
-    const noteOn = [0x90, 60, 64];
-    const noteOff = [0x80, 60, 0];
-    window.__TAURI__?.core
-      ?.invoke("midi_open_output", { outputIndex: Number(selectedOut) })
-      .then(() => {
-        window.__TAURI__?.core?.invoke("midi_send", { bytes: noteOn });
-        setTimeout(() => {
-          window.__TAURI__?.core?.invoke("midi_send", { bytes: noteOff });
-        }, 200);
-      });
-  }
+    const supported =
+      typeof navigator !== "undefined" && "requestMIDIAccess" in navigator;
+    setWebSupported(!!supported);
+    if (!supported) return;
+    navigator
+      .requestMIDIAccess({ sysex: false })
+      .then((a) => {
+        setMidiAccess(a);
+        const ins = Array.from(a.inputs.values());
+        const outs = Array.from(a.outputs.values());
+        setWebInId(ins[0]?.id || "");
+        setWebOutId(outs[0]?.id || "");
+        a.onstatechange = () => {
+          setWebInId((id) => id);
+          setWebOutId((id) => id);
+        };
+      })
+      .catch(() => setMidiAccess(null));
+    return () => {
+      if (webInputRef.current) {
+        try {
+          webInputRef.current.onmidimessage = null;
+        } catch {}
+        webInputRef.current = null;
+      }
+      if (testUrl && testUrl.startsWith("blob:")) {
+        try {
+          URL.revokeObjectURL(testUrl);
+        } catch {}
+      }
+    };
+  }, []);
 
   function connectInWeb() {
     if (!midiAccess) return;
@@ -1063,6 +1674,7 @@ function SettingsModal({ onClose }) {
       }
     }
   }
+
   function sendTestWeb() {
     if (!midiAccess) return;
     let out = null;
@@ -1079,6 +1691,28 @@ function SettingsModal({ onClose }) {
       out.send(noteOn);
       setTimeout(() => out.send(noteOff), 200);
     } catch {}
+  }
+
+  function onPickTestFile(e) {
+    const f = e.target.files?.[0];
+    if (!f) return;
+    try {
+      const url = URL.createObjectURL(f);
+      setTestUrl(url);
+      setTestName(f.name);
+      setTestMsg("");
+      setTimeout(() => audioRef.current?.load(), 0);
+    } catch {
+      setTestMsg("Could not create object URL for file");
+    }
+  }
+
+  function onAudioError() {
+    setTestMsg("HTML5 <audio> failed to load/play this file");
+  }
+
+  function onAudioCanPlay() {
+    setTestMsg("Ready to play");
   }
 
   return (
@@ -1107,123 +1741,85 @@ function SettingsModal({ onClose }) {
               </select>
             </div>
           </div>
-          <div style={{ margin: "16px 0", color: "#bbb" }}>MIDI</div>
-          <div className="rowFlex">
-            <div className="field">
-              <label>Backend</label>
-              <select
-                value={backend}
-                onChange={(e) => setBackend(e.target.value)}
-              >
-                <option value="web">Web MIDI (browser)</option>
-                <option value="native">Native (Rust)</option>
-              </select>
+          <div style={{ margin: "16px 0", color: "#bbb" }}>
+            Audio Test Player
+          </div>
+          <div className="field">
+            <label>Pick audio file (mp3/wav/ogg)</label>
+            <input type="file" accept="audio/*" onChange={onPickTestFile} />
+          </div>
+          <div className="field">
+            <label>{testName || "No file selected"}</label>
+            <audio
+              ref={audioRef}
+              controls
+              src={testUrl}
+              onError={onAudioError}
+              onCanPlay={onAudioCanPlay}
+              style={{ width: "100%" }}
+            />
+            <div style={{ color: testMsg.includes("fail") ? "#e66" : "#8dd" }}>
+              {testMsg}
             </div>
           </div>
-
-          {backend === "native" ? (
-            <div className="rowFlex">
-              <div className="field">
-                <label>Input Device</label>
-                <select
-                  value={selectedIn}
-                  onChange={(e) => setSelectedIn(e.target.value)}
-                >
-                  {inputs.map((d, i) => (
-                    <option key={i} value={i}>
-                      {d.name}
-                    </option>
-                  ))}
-                </select>
+          <div style={{ margin: "16px 0", color: "#bbb" }}>MIDI (Web MIDI)</div>
+          <div className="rowFlex">
+            <div className="field">
+              <label>Web MIDI Input</label>
+              <select
+                value={webInId}
+                onChange={(e) => setWebInId(e.target.value)}
+              >
+                {midiAccess ? (
+                  Array.from(midiAccess.inputs.values()).map((d) => (
+                    <option key={d.id} value={d.id}>{`${
+                      d.manufacturer ? d.manufacturer + " " : ""
+                    }${d.name}`}</option>
+                  ))
+                ) : (
+                  <option value="">
+                    {webSupported ? "No inputs" : "Not supported"}
+                  </option>
+                )}
+              </select>
+              <button
+                className="btn sm"
+                style={{ marginTop: 6 }}
+                onClick={connectInWeb}
+                disabled={!midiAccess}
+              >
+                Connect
+              </button>
+            </div>
+            <div className="field">
+              <label>Web MIDI Output</label>
+              <select
+                value={webOutId}
+                onChange={(e) => setWebOutId(e.target.value)}
+              >
+                {midiAccess ? (
+                  Array.from(midiAccess.outputs.values()).map((d) => (
+                    <option key={d.id} value={d.id}>{`${
+                      d.manufacturer ? d.manufacturer + " " : ""
+                    }${d.name}`}</option>
+                  ))
+                ) : (
+                  <option value="">
+                    {webSupported ? "No outputs" : "Not supported"}
+                  </option>
+                )}
+              </select>
+              <div style={{ display: "flex", gap: 6, marginTop: 6 }}>
                 <button
                   className="btn sm"
-                  style={{ marginTop: 6 }}
-                  onClick={connectInNative}
+                  onClick={sendTestWeb}
+                  disabled={!midiAccess}
                 >
-                  Connect
+                  Send Test Note
                 </button>
               </div>
-              <div className="field">
-                <label>Output Device</label>
-                <select
-                  value={selectedOut}
-                  onChange={(e) => setSelectedOut(e.target.value)}
-                >
-                  {outputs.map((d, i) => (
-                    <option key={i} value={i}>
-                      {d.name}
-                    </option>
-                  ))}
-                </select>
-                <div style={{ display: "flex", gap: 6, marginTop: 6 }}>
-                  <button className="btn sm" onClick={sendTestNative}>
-                    Send Test Note
-                  </button>
-                </div>
-              </div>
             </div>
-          ) : (
-            <>
-              <div className="rowFlex">
-                <div className="field">
-                  <label>Web MIDI Input</label>
-                  <select
-                    value={webInId}
-                    onChange={(e) => setWebInId(e.target.value)}
-                  >
-                    {midiAccess ? (
-                      Array.from(midiAccess.inputs.values()).map((d) => (
-                        <option key={d.id} value={d.id}>{`${
-                          d.manufacturer ? d.manufacturer + " " : ""
-                        }${d.name}`}</option>
-                      ))
-                    ) : (
-                      <option value="">
-                        {webSupported ? "No inputs" : "Not supported"}
-                      </option>
-                    )}
-                  </select>
-                  <button
-                    className="btn sm"
-                    style={{ marginTop: 6 }}
-                    onClick={connectInWeb}
-                    disabled={!midiAccess}
-                  >
-                    Connect
-                  </button>
-                </div>
-                <div className="field">
-                  <label>Web MIDI Output</label>
-                  <select
-                    value={webOutId}
-                    onChange={(e) => setWebOutId(e.target.value)}
-                  >
-                    {midiAccess ? (
-                      Array.from(midiAccess.outputs.values()).map((d) => (
-                        <option key={d.id} value={d.id}>{`${
-                          d.manufacturer ? d.manufacturer + " " : ""
-                        }${d.name}`}</option>
-                      ))
-                    ) : (
-                      <option value="">
-                        {webSupported ? "No outputs" : "Not supported"}
-                      </option>
-                    )}
-                  </select>
-                  <div style={{ display: "flex", gap: 6, marginTop: 6 }}>
-                    <button
-                      className="btn sm"
-                      onClick={sendTestWeb}
-                      disabled={!midiAccess}
-                    >
-                      Send Test Note
-                    </button>
-                  </div>
-                </div>
-              </div>
-            </>
-          )}
-
+          </div>
           <div className="field" style={{ marginTop: 10 }}>
             <label>Incoming MIDI</label>
             <div
@@ -1258,6 +1854,181 @@ function SettingsModal({ onClose }) {
   );
 }
 
+function ApcMapperModal({ onClose }) {
+  const [midiAccess, setMidiAccess] = useState(null);
+  const [inId, setInId] = useState("");
+  const [log, setLog] = useState([]);
+  const [mapJson, setMapJson] = useState("");
+  const inputRef = useRef(null);
+
+  useEffect(() => {
+    const supported =
+      typeof navigator !== "undefined" && "requestMIDIAccess" in navigator;
+    if (!supported) return;
+    navigator
+      .requestMIDIAccess({ sysex: false })
+      .then((a) => {
+        setMidiAccess(a);
+        const ins = Array.from(a.inputs.values());
+        setInId(ins[0]?.id || "");
+      })
+      .catch(() => setMidiAccess(null));
+    return () => {
+      if (inputRef.current) {
+        try {
+          inputRef.current.onmidimessage = null;
+        } catch {}
+        inputRef.current = null;
+      }
+    };
+  }, []);
+
+  function connect() {
+    if (!midiAccess) return;
+    if (inputRef.current) {
+      try {
+        inputRef.current.onmidimessage = null;
+      } catch {}
+    }
+    for (const input of midiAccess.inputs.values()) {
+      if (input.id === inId) {
+        inputRef.current = input;
+        input.onmidimessage = (e) => {
+          const [s, d1, d2] = e.data;
+          const type = s & 0xf0;
+          const ch = (s & 0x0f) + 1;
+          const entry = {
+            raw: Array.from(e.data),
+            type,
+            note: d1,
+            vel: d2,
+            ch,
+            ts: new Date().toLocaleTimeString(),
+          };
+          setLog((l) => [entry, ...l].slice(0, 200));
+        };
+        break;
+      }
+    }
+  }
+
+  return (
+    <div className="modalBackdrop" onClick={onClose}>
+      <div className="modal" onClick={(e) => e.stopPropagation()}>
+        <div className="modalHeader">
+          <div style={{ fontWeight: 600 }}>APC40 mkII Mapper</div>
+          <button className="btn sm" onClick={onClose}>
+            Close
+          </button>
+        </div>
+        <div className="modalBody">
+          <div className="rowFlex">
+            <div className="field">
+              <label>Input</label>
+              <select value={inId} onChange={(e) => setInId(e.target.value)}>
+                {midiAccess ? (
+                  Array.from(midiAccess.inputs.values()).map((d) => (
+                    <option key={d.id} value={d.id}>{`
+                      ${d.manufacturer ? d.manufacturer + " " : ""}${d.name}
+                    `}</option>
+                  ))
+                ) : (
+                  <option value="">No inputs</option>
+                )}
+              </select>
+              <button
+                className="btn sm"
+                style={{ marginTop: 6 }}
+                onClick={connect}
+              >
+                Connect
+              </button>
+            </div>
+            <div className="field" style={{ flex: 2 }}>
+              <label>Instructions</label>
+              <div style={{ color: "#bbb" }}>
+                Press each clip pad you intend to use (top rows). We will record
+                the incoming NOTE number. After pressing 1..40 in your physical
+                grid, copy the table below and send it back.
+              </div>
+            </div>
+          </div>
+          <div className="field">
+            <label>Captured Messages</label>
+            <div
+              style={{
+                height: 220,
+                overflow: "auto",
+                background: "#0f0f0f",
+                border: "1px solid #333",
+                borderRadius: 6,
+                padding: 8,
+                fontFamily: "monospace",
+                fontSize: 12,
+              }}
+            >
+              {log.map((m, i) => (
+                <div key={i}>
+                  {`${m.ts}  type:0x${m.type.toString(16)}  note:${
+                    m.note
+                  }  vel:${m.vel}  ch:${m.ch}  raw:[${m.raw.join(", ")}]`}
+                </div>
+              ))}
+            </div>
+          </div>
+          <div className="field">
+            <label>Custom Input Note → Pad Map (JSON)</label>
+            <textarea
+              placeholder='{"39":33, "38":34, ...} (note -> padNumber 1..40)'
+              value={mapJson}
+              onChange={(e) => setMapJson(e.target.value)}
+              rows={4}
+            />
+          </div>
+        </div>
+        <div className="modalFooter">
+          <button
+            className="btn"
+            onClick={() => {
+              try {
+                const text = log
+                  .filter((x) => x.type === 0x90 && x.vel > 0)
+                  .map((x) => `${x.note}`)
+                  .join(", ");
+                navigator.clipboard?.writeText(text);
+              } catch {}
+            }}
+          >
+            Copy NOTE list
+          </button>
+          <button
+            className="btn"
+            onClick={() => {
+              try {
+                const obj = JSON.parse(mapJson || "{}");
+                localStorage.setItem("apcInNoteMap", JSON.stringify(obj));
+                onClose();
+                try {
+                  alert("Saved APC input note map");
+                } catch {}
+              } catch {
+                try {
+                  alert("Invalid JSON mapping");
+                } catch {}
+              }
+            }}
+          >
+            Save Mapping
+          </button>
+          <button className="btn blue" onClick={onClose}>
+            Done
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function SoundEditorDrawer({ editor, scene, onClose, onSave }) {
   const pad = editor.padId
     ? findPad(scene, editor.groupKey, editor.padId)
@@ -1268,12 +2039,14 @@ function SoundEditorDrawer({ editor, scene, onClose, onSave }) {
       name: "New Sound",
       color:
         editor.groupKey === "background"
-          ? "#2d6cdf"
+          ? "#0000FF" // Blue (APC)
           : editor.groupKey === "ambients"
-          ? "#f2b84b"
-          : "#4caf50",
+          ? "#FF6A00" // Orange (APC)
+          : "#00FF00", // Green (APC)
       playbackMode: "once",
       level: 0.8,
+      fadeInMs: 0,
+      fadeOutMs: 500,
     }
   );
   const [triggers, setTriggers] = useState({
@@ -1364,21 +2137,37 @@ function SoundEditorDrawer({ editor, scene, onClose, onSave }) {
                     const useGroup = e.target.value === "group";
                     setState((s) => ({
                       ...s,
-                      color: useGroup ? undefined : s.color || "#4caf50",
+                      color: useGroup ? undefined : s.color || "#0000FF",
                     }));
                   }}
                 >
                   <option value="group">Use group color</option>
-                  <option value="custom">Custom</option>
+                  <option value="custom">APC color override</option>
                 </select>
-                <input
-                  type="color"
+                <select
                   disabled={!state.color}
-                  value={state.color || "#4caf50"}
+                  value={state.color || "#0000FF"}
                   onChange={(e) =>
                     setState((s) => ({ ...s, color: e.target.value }))
                   }
-                />
+                  style={{
+                    background: state.color || "#0000FF",
+                    color: getReadableTextColor(state.color || "#0000FF"),
+                  }}
+                >
+                  {APC_COLOR_TABLE.map((c) => (
+                    <option
+                      key={c.vel}
+                      value={c.hex}
+                      style={{
+                        background: c.hex,
+                        color: getReadableTextColor(c.hex),
+                      }}
+                    >
+                      {c.name}
+                    </option>
+                  ))}
+                </select>
               </div>
             </div>
           </div>
@@ -1386,13 +2175,22 @@ function SoundEditorDrawer({ editor, scene, onClose, onSave }) {
             <label>Audio File</label>
             <div className="rowFlex">
               <input
-                placeholder="Select a file (mock)"
+                placeholder="Choose audio file"
                 value={state.assetPath || ""}
                 onChange={(e) =>
                   setState((s) => ({ ...s, assetPath: e.target.value }))
                 }
               />
-              <button className="btn">Browse…</button>
+              <input
+                type="file"
+                accept="audio/*"
+                onChange={(e) => {
+                  const f = e.target.files?.[0];
+                  if (!f) return;
+                  const url = URL.createObjectURL(f);
+                  setState((s) => ({ ...s, assetPath: f.name, assetUrl: url }));
+                }}
+              />
             </div>
           </div>
           <div className="rowFlex">
