@@ -452,6 +452,27 @@ body {
   border-top: 1px solid #2a2a2a;
 }
 
+.accordionHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  background: #171717;
+  border: 1px solid #2a2a2a;
+  border-radius: 6px;
+  padding: 8px 10px;
+  cursor: pointer;
+}
+.accordionHeader:hover {
+  filter: brightness(1.05);
+}
+.accordionHeader .chev {
+  transform: rotate(0deg);
+  transition: transform 0.15s ease;
+}
+.accordionHeader .chev.open {
+  transform: rotate(90deg);
+}
+
 .field {
   display: flex;
   flex-direction: column;
