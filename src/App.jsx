@@ -1489,6 +1489,7 @@ function App() {
             groupKey="background"
             mode={mode}
             active={activeGroupKey === "background"}
+            sceneId={currentScene.id}
             onPadToggle={(id) => togglePadPlay("background", id)}
             onSetPlaying={(id, playing) =>
               setPadPlaying("background", id, playing)
@@ -1507,6 +1508,7 @@ function App() {
             groupKey="ambients"
             mode={mode}
             active={activeGroupKey === "ambients"}
+            sceneId={currentScene.id}
             onPadToggle={(id) => togglePadPlay("ambients", id)}
             onSetPlaying={(id, playing) =>
               setPadPlaying("ambients", id, playing)
@@ -1525,6 +1527,7 @@ function App() {
             groupKey="sfx"
             mode={mode}
             active={activeGroupKey === "sfx"}
+            sceneId={currentScene.id}
             onPadToggle={(id) => togglePadPlay("sfx", id)}
             onSetPlaying={(id, playing) => setPadPlaying("sfx", id, playing)}
             onLevelChange={(id, v) => setPadLevel("sfx", id, v)}
@@ -1552,6 +1555,7 @@ function App() {
                   groupKey={`group:${g.id}`}
                   mode={mode}
                   active={false}
+                  sceneId={currentScene.id}
                   onPadToggle={(id) => {
                     const found = findPadByAny(currentScene, id);
                     if (!found) return;
@@ -1913,6 +1917,7 @@ function GroupSection({
   onDelete,
   selectedPadKey,
   setSelectedPadKey,
+  sceneId,
 }) {
   return (
     <div className="groupBlock">
@@ -1944,6 +1949,7 @@ function GroupSection({
             pad={p}
             groupKey={groupKey}
             mode={mode}
+            sceneId={sceneId}
             onToggle={() => onPadToggle(p.id)}
             onSetPlaying={(playing) => onSetPlaying?.(p.id, playing)}
             onLevelChange={(v) => onLevelChange(p.id, v)}
@@ -1967,6 +1973,7 @@ function PadCard({
   pad,
   groupKey,
   mode,
+  sceneId,
   onToggle,
   onSetPlaying,
   onLevelChange,
@@ -2010,7 +2017,7 @@ function PadCard({
     try {
       wsRef.current.on("seek", (progress) => {
         const evt = new CustomEvent("padSeek", {
-          detail: { sceneId: null, groupKey, padId: pad.id, progress },
+          detail: { sceneId: sceneId, groupKey, padId: pad.id, progress },
         });
         window.dispatchEvent(evt);
       });
