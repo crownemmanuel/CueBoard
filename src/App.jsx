@@ -805,6 +805,22 @@ function App() {
     }
   }
 
+  function handleNewShow() {
+    // eslint-disable-next-line no-alert
+    const ok = confirm(
+      "Start a new show? This will clear all saved data and reset."
+    );
+    if (!ok) return;
+    try {
+      localStorage.clear();
+    } catch {}
+    const next = createInitialShow();
+    setShow(next);
+    setCurrentSceneId(next.scenes[0]?.id || null);
+    setSelectedPadKey(null);
+    setStatus("New show created");
+  }
+
   function handleImportFile(e) {
     const f = e.target.files?.[0];
     if (!f) return;
@@ -1073,6 +1089,9 @@ function App() {
           <button className="btn" onClick={() => setMapperOpen(true)}>
             APC Mapper
           </button>
+          <button className="btn red" onClick={handleNewShow}>
+            New Show
+          </button>
           <button className="btn" onClick={handleExport}>
             Export
           </button>
@@ -1147,6 +1166,65 @@ function App() {
             setSelectedPadKey={setSelectedPadKey}
           />
 
+          {(show.groups || [])
+            .filter((g) => !["grp-bg", "grp-amb", "grp-sfx"].includes(g.id))
+            .map((g) => {
+              const pads = [
+                ...(currentScene.background || []),
+                ...(currentScene.ambients || []),
+                ...(currentScene.sfx || []),
+              ].filter((p) => p.groupId === g.id);
+              if (pads.length === 0 && mode !== "edit") return null;
+              return (
+                <GroupSection
+                  key={g.id}
+                  title={g.name}
+                  color={g.color}
+                  pads={pads}
+                  groupKey={`group:${g.id}`}
+                  mode={mode}
+                  active={false}
+                  onPadToggle={(id) => {
+                    const found = findPadByAny(currentScene, id);
+                    if (!found) return;
+                    const [gk] = found;
+                    togglePadPlay(gk, id);
+                  }}
+                  onSetPlaying={(id, playing) => {
+                    const found = findPadByAny(currentScene, id);
+                    if (!found) return;
+                    const [gk] = found;
+                    setPadPlaying(gk, id, playing);
+                  }}
+                  onLevelChange={(id, v) => {
+                    const found = findPadByAny(currentScene, id);
+                    if (!found) return;
+                    const [gk] = found;
+                    setPadLevel(gk, id, v);
+                  }}
+                  onEdit={(id) => {
+                    if (id) {
+                      const found = findPadByAny(currentScene, id);
+                      if (found) {
+                        const [gk] = found;
+                        openEditor(gk, id);
+                      }
+                    } else {
+                      openEditor("sfx", null);
+                    }
+                  }}
+                  onDelete={(id) => {
+                    const found = findPadByAny(currentScene, id);
+                    if (!found) return;
+                    const [gk] = found;
+                    deletePad(gk, id);
+                  }}
+                  selectedPadKey={selectedPadKey}
+                  setSelectedPadKey={setSelectedPadKey}
+                />
+              );
+            })}
+
           {notesOpen && (
             <NotesPanel
               mode={mode}
@@ -1194,6 +1272,7 @@ function App() {
         <SoundEditorDrawer
           editor={editor}
           scene={currentScene}
+          groups={show.groups}
           onClose={() =>
             setEditor({ open: false, groupKey: null, padId: null })
           }
@@ -1246,12 +1325,19 @@ function App() {
 
   function saveEditor(payload) {
     updateScene((scene) => {
-      const arr = groupArray(scene, payload.groupKey);
-      const idx = arr.findIndex((p) => p.id === payload.id);
-      if (idx >= 0) {
-        arr[idx] = { ...arr[idx], ...payload };
+      // Ensure pad is stored only in the selected type lane (background/ambients/sfx)
+      ["background", "ambients", "sfx"].forEach((gk) => {
+        if (gk === payload.groupKey) return;
+        const arr = groupArray(scene, gk);
+        const i = arr.findIndex((p) => p.id === payload.id);
+        if (i >= 0) arr.splice(i, 1);
+      });
+      const dest = groupArray(scene, payload.groupKey);
+      const di = dest.findIndex((p) => p.id === payload.id);
+      if (di >= 0) {
+        dest[di] = { ...dest[di], ...payload };
       } else {
-        arr.push({ ...payload, playing: false, level: payload.level ?? 0.8 });
+        dest.push({ ...payload, playing: false, level: payload.level ?? 0.8 });
       }
       return scene;
     });
@@ -1989,9 +2075,9 @@ function createInitialShow() {
     title: "Production Name",
     scenes: [opening, scene2],
     groups: [
-      { id: "grp-bg", name: "Background", color: "#0000FF" },
-      { id: "grp-amb", name: "Ambient", color: "#FF6A00" },
-      { id: "grp-sfx", name: "Effects", color: "#00FF00" },
+      { id: "grp-bg", name: "Background Music", color: "#0000FF" },
+      { id: "grp-amb", name: "Ambient Noise", color: "#FF6A00" },
+      { id: "grp-sfx", name: "Sound Effects", color: "#00FF00" },
     ],
     routing: { buses: ["Master", "Stage", "Booth"], assignments: {} },
     settings: {
@@ -2746,7 +2832,7 @@ function ApcMapperModal({ onClose }) {
   );
 }
 
-function SoundEditorDrawer({ editor, scene, onClose, onSave }) {
+function SoundEditorDrawer({ editor, scene, groups, onClose, onSave }) {
   const pad = editor.padId
     ? findPad(scene, editor.groupKey, editor.padId)
     : null;
@@ -2760,11 +2846,36 @@ function SoundEditorDrawer({ editor, scene, onClose, onSave }) {
           : editor.groupKey === "ambients"
           ? "#FF6A00" // Orange (APC)
           : "#00FF00", // Green (APC)
+      groupId:
+        editor.groupKey === "background"
+          ? scene?.groups?.find?.((g) => g.id === "grp-bg")?.id || "grp-bg"
+          : editor.groupKey === "ambients"
+          ? scene?.groups?.find?.((g) => g.id === "grp-amb")?.id || "grp-amb"
+          : scene?.groups?.find?.((g) => g.id === "grp-sfx")?.id || "grp-sfx",
       playbackMode: "once",
       level: 0.8,
       fadeInMs: 0,
       fadeOutMs: 500,
     }
+  );
+  useEffect(() => {
+    const gs = groups || [];
+    if (gs.length === 0) return;
+    setState((s) => {
+      const exists = s.groupId && gs.some((g) => g.id === s.groupId);
+      if (exists) return s;
+      return { ...s, groupId: s.groupId || gs[0].id };
+    });
+  }, [groups]);
+  const [laneKey, setLaneKey] = useState(editor.groupKey);
+  const baseGroupIdSet = useMemo(
+    () => new Set(["grp-bg", "grp-amb", "grp-sfx"]),
+    []
+  );
+  const [selectionValue, setSelectionValue] = useState(
+    pad?.groupId && !baseGroupIdSet.has(pad.groupId)
+      ? pad.groupId
+      : editor.groupKey
   );
   const [triggers, setTriggers] = useState({
     onStart: {
@@ -2809,26 +2920,36 @@ function SoundEditorDrawer({ editor, scene, onClose, onSave }) {
           </div>
           <div className="rowFlex">
             <div className="field">
-              <label>Type</label>
-              <select value={editor.groupKey} onChange={() => {}} disabled>
-                <option value="background">Background</option>
-                <option value="ambients">Ambient</option>
-                <option value="sfx">SFX</option>
-              </select>
-            </div>
-            <div className="field">
               <label>Group</label>
               <select
-                value={state.groupId || scene.groups?.[0]?.id || ""}
-                onChange={(e) =>
-                  setState((s) => ({ ...s, groupId: e.target.value }))
-                }
+                value={selectionValue}
+                onChange={(e) => {
+                  const val = e.target.value;
+                  if (
+                    val === "background" ||
+                    val === "ambients" ||
+                    val === "sfx"
+                  ) {
+                    setLaneKey(val);
+                    setSelectionValue(val);
+                  } else {
+                    setSelectionValue(val);
+                    setState((s) => ({ ...s, groupId: val }));
+                  }
+                }}
               >
-                {(scene.groups || []).map((g) => (
-                  <option key={g.id} value={g.id}>
-                    {g.name}
-                  </option>
-                ))}
+                <option value="background">Background Music</option>
+                <option value="ambients">Ambient Noise</option>
+                <option value="sfx">Sound Effects</option>
+                {(groups || [])
+                  .filter(
+                    (g) => !["grp-bg", "grp-amb", "grp-sfx"].includes(g.id)
+                  )
+                  .map((g) => (
+                    <option key={g.id} value={g.id}>
+                      {g.name}
+                    </option>
+                  ))}
               </select>
             </div>
           </div>
@@ -3094,7 +3215,7 @@ function SoundEditorDrawer({ editor, scene, onClose, onSave }) {
                 ...state,
                 triggers,
                 id: state.id,
-                groupKey: editor.groupKey,
+                groupKey: laneKey,
               })
             }
           >
