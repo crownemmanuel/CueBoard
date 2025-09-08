@@ -411,19 +411,16 @@ function App() {
 
   function togglePadPlayByKey(key) {
     const [group, id] = key.split(":");
-    updateScene((scene) => {
-      const pad = findPad(scene, group, id);
-      if (!pad) return scene;
-      if (!pad.assetUrl && !pad.assetPath) {
-        setStatus("No audio attached to this pad");
-        return scene;
-      }
-      const next = !pad.playing;
-      pad.playing = next;
-      handlePadAudio(scene, group, pad, next);
-      setStatus(`${pad.label || pad.name} ${next ? "started" : "stopped"}`);
-      return scene;
-    });
+    const sc = currentSceneRef.current;
+    const pad = findPad(sc, group, id);
+    if (!pad) return;
+    if (!pad.assetUrl && !pad.assetPath) {
+      setStatus("No audio attached to this pad");
+      return;
+    }
+    const next = !pad.playing;
+    setPadPlaying(group, id, next);
+    setStatus(`${pad.label || pad.name} ${next ? "started" : "stopped"}`);
   }
 
   function handleStopAll() {
@@ -835,43 +832,67 @@ function App() {
         if (targetScene.id !== currentScene.id) {
           stopPad(targetScene.id, gk, p.id);
         }
-      } else if (t.action === "fade") {
+      } else if (
+        t.action === "fade" ||
+        t.action === "fadeIn" ||
+        t.action === "fadeOut"
+      ) {
         const ms = Math.max(0, Number.isFinite(t.timeMs) ? t.timeMs : 200);
         const steps = Math.max(1, Math.floor(ms / 16));
-        if (p.playing) {
-          const from = p.level ?? 0.8;
+
+        const targetLevel =
+          typeof p.baseLevel === "number"
+            ? p.baseLevel
+            : typeof p.level === "number"
+            ? p.level
+            : 0.8;
+
+        const fadeDown = () => {
+          const from = p.level ?? targetLevel;
           let i = 0;
-          const down = () => {
+          const step = () => {
             const v = from * (1 - i / steps);
             setPadLevel(gk, p.id, v, targetScene.id);
             i++;
-            if (i <= steps) requestAnimationFrame(down);
+            if (i <= steps) requestAnimationFrame(step);
             else {
               setPadPlaying(gk, p.id, false, targetScene.id);
-              if (targetScene.id !== currentScene.id)
+              if (targetScene.id !== currentScene.id) {
                 stopPad(targetScene.id, gk, p.id);
+              }
             }
           };
-          requestAnimationFrame(down);
-        } else {
-          const targetLevel =
-            typeof p.baseLevel === "number"
-              ? p.baseLevel
-              : typeof p.level === "number"
-              ? p.level
-              : 0.8;
-          setPadLevel(gk, p.id, 0, targetScene.id);
-          setPadPlaying(gk, p.id, true, targetScene.id);
-          if (targetScene.id !== currentScene.id)
-            playPad(targetScene.id, gk, p);
+          requestAnimationFrame(step);
+        };
+
+        const fadeUp = () => {
+          // Ensure it is playing and start from 0 if currently silent
+          if (!p.playing) {
+            setPadLevel(gk, p.id, 0, targetScene.id);
+            setPadPlaying(gk, p.id, true, targetScene.id);
+            if (targetScene.id !== currentScene.id) {
+              playPad(targetScene.id, gk, p);
+            }
+          }
+          const from = p.level ?? 0;
           let i = 0;
-          const up = () => {
-            const v = targetLevel * (i / steps);
+          const step = () => {
+            const v = from + (targetLevel - from) * (i / steps);
             setPadLevel(gk, p.id, v, targetScene.id);
             i++;
-            if (i <= steps) requestAnimationFrame(up);
+            if (i <= steps) requestAnimationFrame(step);
           };
-          requestAnimationFrame(up);
+          requestAnimationFrame(step);
+        };
+
+        if (t.action === "fadeOut") {
+          if (p.playing) fadeDown();
+        } else if (t.action === "fadeIn") {
+          fadeUp();
+        } else {
+          // Backward-compatibility: decide direction based on current state
+          if (p.playing) fadeDown();
+          else fadeUp();
         }
       }
     });
@@ -1708,7 +1729,12 @@ function PadCard({
       barWidth: 2,
       normalize: true,
     });
-    wsRef.current.load(pad.assetUrl || pad.assetPath);
+    try {
+      const p = wsRef.current.load(pad.assetUrl || pad.assetPath);
+      if (p && typeof p.catch === "function") {
+        p.catch(() => {});
+      }
+    } catch {}
     return () => {
       try {
         wsRef.current?.destroy();
@@ -1718,16 +1744,35 @@ function PadCard({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pad.assetUrl, pad.assetPath, pad.playbackMode]);
 
-  // Do not drive WaveSurfer playback; it is used for visualization only.
+  // Drive WaveSurfer playback to visualize progress (audio remains muted)
 
-  // Apply volume changes immediately to WaveSurfer when level changes
+  // Keep WaveSurfer muted so it doesn't emit audio (we use <audio> for sound)
   useEffect(() => {
     const ws = wsRef.current;
     if (!ws) return;
     try {
-      ws.setVolume?.(pad.level || 0);
+      ws.setVolume?.(0);
     } catch {}
   }, [pad.level]);
+
+  // Sync waveform progress with pad play/pause
+  useEffect(() => {
+    const ws = wsRef.current;
+    if (!ws) return;
+    try {
+      if (pad.playing) {
+        try {
+          ws.seekTo?.(0);
+        } catch {}
+        ws.play?.().catch(() => {});
+      } else {
+        ws.pause?.();
+        try {
+          ws.seekTo?.(0);
+        } catch {}
+      }
+    } catch {}
+  }, [pad.playing]);
 
   const handleContextMenu = (e) => {
     e.preventDefault();
@@ -1737,6 +1782,14 @@ function PadCard({
       pad.label = next.trim();
     }
   };
+
+  const hasTriggers = (() => {
+    if (!pad?.triggers) return false;
+    if (Array.isArray(pad.triggers)) return pad.triggers.length > 0;
+    const t = pad.triggers;
+    const valid = (x) => x && x.action && x.action !== "none";
+    return valid(t.onStart) || valid(t.onStop);
+  })();
 
   return (
     <div
@@ -1751,6 +1804,11 @@ function PadCard({
       <div className="padHeader" style={headerStyle}>
         {pad.label || pad.name}
       </div>
+      {mode !== "edit" && hasTriggers && (
+        <div className="padBadge" title="Has triggers">
+          ⚡
+        </div>
+      )}
       {mode === "edit" && (
         <div className="padTools">
           <button
@@ -2404,7 +2462,13 @@ async function loadRootDirectoryHandle() {
   }
 }
 
-function SettingsModal({ settings, scene, onUpdateSettings, onUpdatePadRoute, onClose }) {
+function SettingsModal({
+  settings,
+  scene,
+  onUpdateSettings,
+  onUpdatePadRoute,
+  onClose,
+}) {
   const [log, setLog] = useState([]);
   const [midiAccess, setMidiAccess] = useState(null);
   const [webInId, setWebInId] = useState("");
@@ -2556,12 +2620,22 @@ function SettingsModal({ settings, scene, onUpdateSettings, onUpdatePadRoute, on
                     const next = structuredClone(prev || {});
                     const list = Array.isArray(next.audioRouting?.outputs)
                       ? next.audioRouting.outputs
-                      : [{ key: "master", label: "Master", deviceId: "default" }];
-                    list[0] = { ...(list[0] || { key: "master", label: "Master" }), deviceId };
+                      : [
+                          {
+                            key: "master",
+                            label: "Master",
+                            deviceId: "default",
+                          },
+                        ];
+                    list[0] = {
+                      ...(list[0] || { key: "master", label: "Master" }),
+                      deviceId,
+                    };
                     next.audioRouting = {
                       ...(next.audioRouting || {}),
                       outputs: list,
-                      groupDefault: next.audioRouting?.groupDefault || groupDefault,
+                      groupDefault:
+                        next.audioRouting?.groupDefault || groupDefault,
                     };
                     return next;
                   });
@@ -2569,7 +2643,10 @@ function SettingsModal({ settings, scene, onUpdateSettings, onUpdatePadRoute, on
               >
                 <option value="default">System Default</option>
                 {audioOutputs.map((d) => (
-                  <option key={d.deviceId || d.label} value={d.deviceId || "default"}>
+                  <option
+                    key={d.deviceId || d.label}
+                    value={d.deviceId || "default"}
+                  >
                     {d.label || `Device ${d.deviceId || ""}`}
                   </option>
                 ))}
@@ -2579,7 +2656,9 @@ function SettingsModal({ settings, scene, onUpdateSettings, onUpdatePadRoute, on
               <label>Sample Rate</label>
               <select
                 value={String(settings?.sampleRate || 48000)}
-                onChange={(e) => onUpdateSettings({ sampleRate: Number(e.target.value) })}
+                onChange={(e) =>
+                  onUpdateSettings({ sampleRate: Number(e.target.value) })
+                }
               >
                 <option value="44100">44.1 kHz</option>
                 <option value="48000">48 kHz</option>
@@ -2594,7 +2673,13 @@ function SettingsModal({ settings, scene, onUpdateSettings, onUpdatePadRoute, on
                   const next = structuredClone(prev || {});
                   const list = Array.isArray(next.audioRouting?.outputs)
                     ? next.audioRouting.outputs
-                    : [{ key: "master", label: "Master", deviceId: outputs[0]?.deviceId || "default" }];
+                    : [
+                        {
+                          key: "master",
+                          label: "Master",
+                          deviceId: outputs[0]?.deviceId || "default",
+                        },
+                      ];
                   const idx = list.length + 1;
                   const key = idx === 1 ? "master" : `out${idx}`;
                   const label = idx === 1 ? "Master" : `Output ${idx}`;
@@ -2602,7 +2687,8 @@ function SettingsModal({ settings, scene, onUpdateSettings, onUpdatePadRoute, on
                   next.audioRouting = {
                     ...(next.audioRouting || {}),
                     outputs: list,
-                    groupDefault: next.audioRouting?.groupDefault || groupDefault,
+                    groupDefault:
+                      next.audioRouting?.groupDefault || groupDefault,
                   };
                   return next;
                 });
@@ -2628,7 +2714,11 @@ function SettingsModal({ settings, scene, onUpdateSettings, onUpdatePadRoute, on
                             : outputs;
                           const idx = 1 + i;
                           list[idx] = { ...list[idx], label: e.target.value };
-                          next.audioRouting = { ...(next.audioRouting || {}), outputs: list, groupDefault };
+                          next.audioRouting = {
+                            ...(next.audioRouting || {}),
+                            outputs: list,
+                            groupDefault,
+                          };
                           return next;
                         });
                       }}
@@ -2645,14 +2735,21 @@ function SettingsModal({ settings, scene, onUpdateSettings, onUpdatePadRoute, on
                             : outputs;
                           const idx = 1 + i;
                           list[idx] = { ...list[idx], deviceId };
-                          next.audioRouting = { ...(next.audioRouting || {}), outputs: list, groupDefault };
+                          next.audioRouting = {
+                            ...(next.audioRouting || {}),
+                            outputs: list,
+                            groupDefault,
+                          };
                           return next;
                         });
                       }}
                     >
                       <option value="default">System Default</option>
                       {audioOutputs.map((d) => (
-                        <option key={d.deviceId || d.label} value={d.deviceId || "default"}>
+                        <option
+                          key={d.deviceId || d.label}
+                          value={d.deviceId || "default"}
+                        >
                           {d.label || `Device ${d.deviceId || ""}`}
                         </option>
                       ))}
@@ -2672,8 +2769,15 @@ function SettingsModal({ settings, scene, onUpdateSettings, onUpdatePadRoute, on
                 onChange={(e) =>
                   onUpdateSettings((prev) => {
                     const next = structuredClone(prev || {});
-                    const gd = { ...(next.audioRouting?.groupDefault || groupDefault), background: e.target.value };
-                    next.audioRouting = { ...(next.audioRouting || {}), outputs, groupDefault: gd };
+                    const gd = {
+                      ...(next.audioRouting?.groupDefault || groupDefault),
+                      background: e.target.value,
+                    };
+                    next.audioRouting = {
+                      ...(next.audioRouting || {}),
+                      outputs,
+                      groupDefault: gd,
+                    };
                     return next;
                   })
                 }
@@ -2692,8 +2796,15 @@ function SettingsModal({ settings, scene, onUpdateSettings, onUpdatePadRoute, on
                 onChange={(e) =>
                   onUpdateSettings((prev) => {
                     const next = structuredClone(prev || {});
-                    const gd = { ...(next.audioRouting?.groupDefault || groupDefault), ambients: e.target.value };
-                    next.audioRouting = { ...(next.audioRouting || {}), outputs, groupDefault: gd };
+                    const gd = {
+                      ...(next.audioRouting?.groupDefault || groupDefault),
+                      ambients: e.target.value,
+                    };
+                    next.audioRouting = {
+                      ...(next.audioRouting || {}),
+                      outputs,
+                      groupDefault: gd,
+                    };
                     return next;
                   })
                 }
@@ -2712,8 +2823,15 @@ function SettingsModal({ settings, scene, onUpdateSettings, onUpdatePadRoute, on
                 onChange={(e) =>
                   onUpdateSettings((prev) => {
                     const next = structuredClone(prev || {});
-                    const gd = { ...(next.audioRouting?.groupDefault || groupDefault), sfx: e.target.value };
-                    next.audioRouting = { ...(next.audioRouting || {}), outputs, groupDefault: gd };
+                    const gd = {
+                      ...(next.audioRouting?.groupDefault || groupDefault),
+                      sfx: e.target.value,
+                    };
+                    next.audioRouting = {
+                      ...(next.audioRouting || {}),
+                      outputs,
+                      groupDefault: gd,
+                    };
                     return next;
                   })
                 }
@@ -2727,17 +2845,27 @@ function SettingsModal({ settings, scene, onUpdateSettings, onUpdatePadRoute, on
             </div>
           </div>
 
-          <div style={{ margin: "16px 0", color: "#bbb" }}>Per-Pad Routing (Current Scene)</div>
+          <div style={{ margin: "16px 0", color: "#bbb" }}>
+            Per-Pad Routing (Current Scene)
+          </div>
           <div className="rowFlex">
             <div className="field" style={{ flex: 1 }}>
               <label>Background</label>
               {(scene?.background || []).map((p) => (
-                <div key={p.id} className="rowFlex" style={{ gap: 6, marginBottom: 6 }}>
-                  <div style={{ width: 140, color: "#ddd" }}>{p.label || p.name}</div>
+                <div
+                  key={p.id}
+                  className="rowFlex"
+                  style={{ gap: 6, marginBottom: 6 }}
+                >
+                  <div style={{ width: 140, color: "#ddd" }}>
+                    {p.label || p.name}
+                  </div>
                   <select
                     style={{ flex: 1 }}
                     value={p.routeKey || "master"}
-                    onChange={(e) => onUpdatePadRoute?.("background", p.id, e.target.value)}
+                    onChange={(e) =>
+                      onUpdatePadRoute?.("background", p.id, e.target.value)
+                    }
                   >
                     {outputs.map((o) => (
                       <option key={o.key} value={o.key}>
@@ -2751,12 +2879,20 @@ function SettingsModal({ settings, scene, onUpdateSettings, onUpdatePadRoute, on
             <div className="field" style={{ flex: 1 }}>
               <label>Ambient</label>
               {(scene?.ambients || []).map((p) => (
-                <div key={p.id} className="rowFlex" style={{ gap: 6, marginBottom: 6 }}>
-                  <div style={{ width: 140, color: "#ddd" }}>{p.label || p.name}</div>
+                <div
+                  key={p.id}
+                  className="rowFlex"
+                  style={{ gap: 6, marginBottom: 6 }}
+                >
+                  <div style={{ width: 140, color: "#ddd" }}>
+                    {p.label || p.name}
+                  </div>
                   <select
                     style={{ flex: 1 }}
                     value={p.routeKey || "master"}
-                    onChange={(e) => onUpdatePadRoute?.("ambients", p.id, e.target.value)}
+                    onChange={(e) =>
+                      onUpdatePadRoute?.("ambients", p.id, e.target.value)
+                    }
                   >
                     {outputs.map((o) => (
                       <option key={o.key} value={o.key}>
@@ -2770,12 +2906,20 @@ function SettingsModal({ settings, scene, onUpdateSettings, onUpdatePadRoute, on
             <div className="field" style={{ flex: 1 }}>
               <label>SFX</label>
               {(scene?.sfx || []).map((p) => (
-                <div key={p.id} className="rowFlex" style={{ gap: 6, marginBottom: 6 }}>
-                  <div style={{ width: 140, color: "#ddd" }}>{p.label || p.name}</div>
+                <div
+                  key={p.id}
+                  className="rowFlex"
+                  style={{ gap: 6, marginBottom: 6 }}
+                >
+                  <div style={{ width: 140, color: "#ddd" }}>
+                    {p.label || p.name}
+                  </div>
                   <select
                     style={{ flex: 1 }}
                     value={p.routeKey || "master"}
-                    onChange={(e) => onUpdatePadRoute?.("sfx", p.id, e.target.value)}
+                    onChange={(e) =>
+                      onUpdatePadRoute?.("sfx", p.id, e.target.value)
+                    }
                   >
                     {outputs.map((o) => (
                       <option key={o.key} value={o.key}>
@@ -3055,7 +3199,15 @@ function ApcMapperModal({ onClose }) {
   );
 }
 
-function SoundEditorDrawer({ editor, scene, settings, groups, onClose, onSave }) {
+function SoundEditorDrawer({
+  editor,
+  scene,
+  settings,
+  groups,
+  scenes,
+  onClose,
+  onSave,
+}) {
   const pad = editor.padId
     ? findPad(scene, editor.groupKey, editor.padId)
     : null;
@@ -3125,7 +3277,7 @@ function SoundEditorDrawer({ editor, scene, settings, groups, onClose, onSave })
   const ensureTrigger = (overrides = {}) => ({
     id: `trg-${Math.random().toString(36).slice(2, 8)}`,
     phase: "onStart", // or "onStop"
-    action: "none", // none | play | stop | fade
+    action: "none", // none | play | stop | fade | fadeIn | fadeOut
     sceneId: scene.id,
     padId: pad?.id || "",
     timeMs: 200,
@@ -3334,7 +3486,9 @@ function SoundEditorDrawer({ editor, scene, settings, groups, onClose, onSave })
                       <option value="none">None</option>
                       <option value="play">Play</option>
                       <option value="stop">Stop</option>
-                      <option value="fade">Fade</option>
+                      <option value="fade">Fade (auto)</option>
+                      <option value="fadeIn">Fade In</option>
+                      <option value="fadeOut">Fade Out</option>
                     </select>
                   </div>
                   <div className="field">
@@ -3393,7 +3547,9 @@ function SoundEditorDrawer({ editor, scene, settings, groups, onClose, onSave })
                       })()}
                     </select>
                   </div>
-                  {tr.action === "fade" && (
+                  {(tr.action === "fade" ||
+                    tr.action === "fadeIn" ||
+                    tr.action === "fadeOut") && (
                     <div className="field">
                       <label>Time (ms)</label>
                       <input
