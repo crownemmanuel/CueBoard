@@ -282,7 +282,7 @@ body {
   width: 100%;
   height: 56px;
   background: #0f0f0f;
-  border: 1px solid #333;
+  border: 1px solid #2a2a2a;
   border-radius: 6px;
   overflow: hidden;
 }
@@ -580,4 +580,62 @@ body {
   text-align: left;
   color: #bbb;
   font-weight: 600;
+}
+
+/* External Seek Bar Styling */
+.seekBarContainer {
+  margin-top: 8px;
+  padding: 4px 8px;
+}
+
+.seekBar {
+  width: 100%;
+  height: 6px;
+  border-radius: 3px;
+  background: rgba(0, 0, 0, 0.3);
+  outline: none;
+  -webkit-appearance: none;
+  appearance: none;
+  cursor: pointer;
+}
+
+.seekBar::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: #4fc3f7;
+  cursor: pointer;
+  border: 2px solid #1a1a1a;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.4);
+}
+
+.seekBar::-webkit-slider-thumb:hover {
+  background: #03dac6;
+  border-color: #0f0f0f;
+  transform: scale(1.1);
+  box-shadow: 0 3px 8px rgba(0, 0, 0, 0.5);
+}
+
+.seekBar::-moz-range-thumb {
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: #4fc3f7;
+  cursor: pointer;
+  border: 2px solid #1a1a1a;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.4);
+}
+
+.seekBar::-moz-range-thumb:hover {
+  background: #03dac6;
+  border-color: #0f0f0f;
+  transform: scale(1.1);
+  box-shadow: 0 3px 8px rgba(0, 0, 0, 0.5);
+}
+
+.seekBar:disabled {
+  opacity: 0.3;
+  cursor: not-allowed;
 }

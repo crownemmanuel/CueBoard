@@ -80,6 +80,49 @@ function chooseDefaultOutput(access, preferId) {
 function App() {
   const [mode, setMode] = useState("show"); // "show" | "edit"
   const [status, setStatus] = useState("Ready");
+
+  // Seek bar state for each pad (keyed by sceneId:groupKey:padId)
+  const [seekStates, setSeekStates] = useState({});
+
+  // Real-time seek bar updates
+  useEffect(() => {
+    const updateSeekBars = () => {
+      // Update seek bar positions for all playing pads (only when not actively seeking)
+      padAudioRef.current.forEach((audioRef, key) => {
+        if (
+          audioRef &&
+          audioRef.el &&
+          !audioRef.el.paused &&
+          audioRef.el.duration > 0
+        ) {
+          const progress = audioRef.el.currentTime / audioRef.el.duration;
+          const [sceneId, groupKey, padId] = key.split(":");
+          const padSeekKey = `${sceneId}:${groupKey}:${padId}`;
+
+          setSeekStates((prev) => {
+            const currentState = prev[padSeekKey] || {};
+            // Only update if user is not actively seeking
+            if (!currentState.isSeeking) {
+              return {
+                ...prev,
+                [padSeekKey]: {
+                  ...currentState,
+                  progress,
+                },
+              };
+            }
+            return prev;
+          });
+        }
+      });
+    };
+
+    // Update every 100ms for smooth real-time updates
+    const interval = setInterval(updateSeekBars, 100);
+
+    return () => clearInterval(interval);
+  }, []);
+
   const [show, setShow] = useState(() => {
     const saved = loadSavedShow() || createInitialShow();
     // Clear all playing states on app load to prevent stale ticker animations
@@ -944,6 +987,23 @@ function App() {
         }));
       }
     };
+
+    // Sync WaveSurfer progress with HTML Audio element
+    el.ontimeupdate = () => {
+      try {
+        const waveSurferMap = window.waveSurferInstances;
+        if (!waveSurferMap) return;
+
+        const padKey = `${sceneId}:${groupKey}:${pad.id}`;
+        const ws = waveSurferMap.get(padKey);
+        if (ws && el.duration > 0) {
+          const progress = el.currentTime / el.duration;
+          ws.seekTo(progress);
+        }
+      } catch (error) {
+        // Silently handle any errors with progress sync
+      }
+    };
     el.onerror = () => {
       setStatus("Could not play this audio file");
     };
@@ -1005,6 +1065,25 @@ function App() {
     try {
       ref.el.pause();
       ref.el.currentTime = 0;
+      // Reset WaveSurfer progress
+      const waveSurferMap = window.waveSurferInstances;
+      if (waveSurferMap) {
+        const padKey = `${sceneId}:${key.split(":")[1]}:${padId}`;
+        const ws = waveSurferMap.get(padKey);
+        if (ws) {
+          ws.seekTo(0);
+        }
+      }
+      // Reset seek bar to 0
+      const padSeekKey = `${sceneId}:${key.split(":")[1]}:${padId}`;
+      setSeekStates((prev) => ({
+        ...prev,
+        [padSeekKey]: {
+          ...prev[padSeekKey],
+          progress: 0,
+          isSeeking: false,
+        },
+      }));
     } catch {}
     padAudioRef.current.delete(key);
   }
@@ -1022,6 +1101,16 @@ function App() {
       console.log("Pausing audio at currentTime:", ref.el.currentTime);
       ref.el.pause();
       // Don't reset currentTime - keep position for resume
+      // Update WaveSurfer progress to match paused position
+      const waveSurferMap = window.waveSurferInstances;
+      if (waveSurferMap && ref.el.duration > 0) {
+        const padKey = `${sceneId}:${key.split(":")[1]}:${padId}`;
+        const ws = waveSurferMap.get(padKey);
+        if (ws) {
+          const progress = ref.el.currentTime / ref.el.duration;
+          ws.seekTo(progress);
+        }
+      }
     } catch (error) {
       console.log("Pause error:", error);
     }
@@ -1061,7 +1150,37 @@ function App() {
         }
       } catch {}
 
-      el.currentTime = 0; // Start from beginning for resume if no previous position
+      // Store seek position for later use
+      const padSeekKey = `${sceneId}:${groupKey}:${pad.id}`;
+      const seekState = seekStates[padSeekKey];
+      const targetProgress =
+        seekState && seekState.progress !== undefined && seekState.progress > 0
+          ? seekState.progress
+          : 0;
+
+      // Set up load handler to seek to the correct position once audio loads
+      el.addEventListener("loadedmetadata", () => {
+        if (targetProgress > 0) {
+          el.currentTime = targetProgress * el.duration;
+          console.log(
+            "Resume from seek bar position:",
+            targetProgress,
+            "->",
+            el.currentTime
+          );
+
+          // Clear seeking state so real-time updates work
+          setSeekStates((prev) => ({
+            ...prev,
+            [padSeekKey]: {
+              ...prev[padSeekKey],
+              isSeeking: false,
+            },
+          }));
+        }
+      });
+
+      el.currentTime = 0; // Start from beginning initially
       ref = { el };
       padAudioRef.current.set(key, ref);
 
@@ -1076,6 +1195,23 @@ function App() {
           });
         }
       };
+
+      // Sync WaveSurfer progress with HTML Audio element
+      el.ontimeupdate = () => {
+        try {
+          const waveSurferMap = window.waveSurferInstances;
+          if (!waveSurferMap) return;
+
+          const padKey = `${sceneId}:${groupKey}:${pad.id}`;
+          const ws = waveSurferMap.get(padKey);
+          if (ws && el.duration > 0) {
+            const progress = el.currentTime / el.duration;
+            ws.seekTo(progress);
+          }
+        } catch (error) {
+          // Silently handle any errors with progress sync
+        }
+      };
     }
 
     try {
@@ -1085,7 +1221,35 @@ function App() {
         "duration:",
         ref.el.duration
       );
-      // Just resume without resetting currentTime
+
+      // Check if there's a seek bar position set and seek to it
+      const padSeekKey = `${sceneId}:${groupKey}:${pad.id}`;
+      const seekState = seekStates[padSeekKey];
+      if (
+        seekState &&
+        seekState.progress !== undefined &&
+        seekState.progress > 0
+      ) {
+        const targetTime = seekState.progress * ref.el.duration;
+        ref.el.currentTime = targetTime;
+        console.log(
+          "Resume existing audio from seek bar position:",
+          seekState.progress,
+          "->",
+          targetTime
+        );
+
+        // Clear seeking state so real-time updates work
+        setSeekStates((prev) => ({
+          ...prev,
+          [padSeekKey]: {
+            ...prev[padSeekKey],
+            isSeeking: false,
+          },
+        }));
+      }
+
+      // Just resume without resetting currentTime (unless we just set it above)
       const p = ref.el.play();
       if (p && typeof p.then === "function") {
         p.then(() => {
@@ -1137,6 +1301,73 @@ function App() {
         ref.el.currentTime = dur * p;
       }
     } catch {}
+  }
+
+  // Seek bar handlers following web search results pattern
+  function handleSeekStart(sceneId, groupKey, padId) {
+    const key = padKey(sceneId, groupKey, padId);
+    const ref = padAudioRef.current.get(key);
+    if (!ref) return;
+
+    // Store whether audio was playing before seek
+    const wasPlaying = !ref.el.paused && !ref.el.ended;
+    const padSeekKey = `${sceneId}:${groupKey}:${padId}`;
+
+    setSeekStates((prev) => ({
+      ...prev,
+      [padSeekKey]: {
+        ...prev[padSeekKey],
+        wasPlaying,
+        isSeeking: true,
+      },
+    }));
+
+    // Pause audio during seek
+    ref.el.pause();
+  }
+
+  function handleSeekChange(sceneId, groupKey, padId, progress) {
+    const padSeekKey = `${sceneId}:${groupKey}:${padId}`;
+
+    // Update seek bar position
+    setSeekStates((prev) => ({
+      ...prev,
+      [padSeekKey]: {
+        ...prev[padSeekKey],
+        progress,
+      },
+    }));
+  }
+
+  function handleSeekEnd(sceneId, groupKey, padId, progress) {
+    const key = padKey(sceneId, groupKey, padId);
+    const ref = padAudioRef.current.get(key);
+    if (!ref) return;
+
+    const padSeekKey = `${sceneId}:${groupKey}:${padId}`;
+    const seekState = seekStates[padSeekKey] || {};
+
+    // Set the audio to the new position
+    const p = Math.max(0, Math.min(1, Number(progress) || 0));
+    const dur = Number(ref.el.duration);
+    if (Number.isFinite(dur) && dur > 0) {
+      ref.el.currentTime = dur * p;
+    }
+
+    // Resume playback if it was playing before
+    if (seekState.wasPlaying) {
+      ref.el.play().catch(() => {});
+    }
+
+    // Update final seek state
+    setSeekStates((prev) => ({
+      ...prev,
+      [padSeekKey]: {
+        ...prev[padSeekKey],
+        progress,
+        isSeeking: false,
+      },
+    }));
   }
 
   function stopAllAudio() {
@@ -1597,11 +1828,18 @@ function App() {
             onSetPlaying={(id, playing) =>
               setPadPlaying("background", id, playing)
             }
+            onResume={(id) => setPadPlaying("background", id, true, null, true)}
             onLevelChange={(id, v) => setPadLevel("background", id, v)}
             onEdit={(id) => openEditor("background", id)}
             onDelete={(id) => deletePad("background", id)}
             selectedPadKey={selectedPadKey}
             setSelectedPadKey={setSelectedPadKey}
+            seekStates={seekStates}
+            onSeekStart={handleSeekStart}
+            onSeekChange={handleSeekChange}
+            onSeekEnd={handleSeekEnd}
+            padAudioRef={padAudioRef}
+            show={show}
           />
 
           <GroupSection
@@ -1616,11 +1854,18 @@ function App() {
             onSetPlaying={(id, playing) =>
               setPadPlaying("ambients", id, playing)
             }
+            onResume={(id) => setPadPlaying("ambients", id, true, null, true)}
             onLevelChange={(id, v) => setPadLevel("ambients", id, v)}
             onEdit={(id) => openEditor("ambients", id)}
             onDelete={(id) => deletePad("ambients", id)}
             selectedPadKey={selectedPadKey}
             setSelectedPadKey={setSelectedPadKey}
+            seekStates={seekStates}
+            onSeekStart={handleSeekStart}
+            onSeekChange={handleSeekChange}
+            onSeekEnd={handleSeekEnd}
+            padAudioRef={padAudioRef}
+            show={show}
           />
 
           <GroupSection
@@ -1633,6 +1878,13 @@ function App() {
             sceneId={currentScene.id}
             onPadToggle={(id) => togglePadPlay("sfx", id)}
             onSetPlaying={(id, playing) => setPadPlaying("sfx", id, playing)}
+            onResume={(id) => setPadPlaying("sfx", id, true, null, true)}
+            seekStates={seekStates}
+            onSeekStart={handleSeekStart}
+            onSeekChange={handleSeekChange}
+            onSeekEnd={handleSeekEnd}
+            padAudioRef={padAudioRef}
+            show={show}
             onLevelChange={(id, v) => setPadLevel("sfx", id, v)}
             onEdit={(id) => openEditor("sfx", id)}
             onDelete={(id) => deletePad("sfx", id)}
@@ -1671,6 +1923,12 @@ function App() {
                     const [gk] = found;
                     setPadPlaying(gk, id, playing);
                   }}
+                  onResume={(id) => {
+                    const found = findPadByAny(currentScene, id);
+                    if (!found) return;
+                    const [gk] = found;
+                    setPadPlaying(gk, id, true, null, true); // true for useResume
+                  }}
                   onLevelChange={(id, v) => {
                     const found = findPadByAny(currentScene, id);
                     if (!found) return;
@@ -1696,6 +1954,12 @@ function App() {
                   }}
                   selectedPadKey={selectedPadKey}
                   setSelectedPadKey={setSelectedPadKey}
+                  seekStates={seekStates}
+                  onSeekStart={handleSeekStart}
+                  onSeekChange={handleSeekChange}
+                  onSeekEnd={handleSeekEnd}
+                  padAudioRef={padAudioRef}
+                  show={show}
                 />
               );
             })}
@@ -1861,7 +2125,27 @@ function App() {
       const pad = findPad(scene, groupKey, id);
       if (!pad) return scene;
       pad.playing = !!playing;
-      if (!useResume) {
+
+      // Initialize seek bar position when starting playback
+      if (playing && !useResume) {
+        const padSeekKey = `${targetSceneId}:${groupKey}:${id}`;
+        setSeekStates((prev) => ({
+          ...prev,
+          [padSeekKey]: {
+            ...prev[padSeekKey],
+            progress: 0,
+            isSeeking: false,
+          },
+        }));
+      }
+
+      if (useResume) {
+        // Handle resume logic
+        if (playing) {
+          resumePad(targetSceneId, groupKey, pad);
+          setStatus(`${pad.label || pad.name} resumed`);
+        }
+      } else {
         // Use pause when stopping (playing = false) to preserve position for resume
         const shouldUsePause = !playing;
         handlePadAudio(scene, groupKey, pad, !!playing, shouldUsePause);
@@ -2030,12 +2314,19 @@ function GroupSection({
   active,
   onPadToggle,
   onSetPlaying,
+  onResume,
   onLevelChange,
   onEdit,
   onDelete,
   selectedPadKey,
   setSelectedPadKey,
   sceneId,
+  seekStates,
+  onSeekStart,
+  onSeekChange,
+  onSeekEnd,
+  padAudioRef,
+  show,
 }) {
   return (
     <div className="groupBlock">
@@ -2070,11 +2361,18 @@ function GroupSection({
             sceneId={sceneId}
             onToggle={() => onPadToggle(p.id)}
             onSetPlaying={(playing) => onSetPlaying?.(p.id, playing)}
+            onResume={() => onResume?.(p.id)}
             onLevelChange={(v) => onLevelChange(p.id, v)}
             selected={selectedPadKey === `${groupKey}:${p.id}`}
             onSelect={() => setSelectedPadKey(`${groupKey}:${p.id}`)}
             onEdit={() => onEdit?.(p.id)}
             onDelete={() => onDelete?.(p.id)}
+            seekStates={seekStates}
+            onSeekStart={onSeekStart}
+            onSeekChange={onSeekChange}
+            onSeekEnd={onSeekEnd}
+            padAudioRef={padAudioRef}
+            show={show}
           />
         ))}
         {mode === "edit" && (
@@ -2094,11 +2392,18 @@ function PadCard({
   sceneId,
   onToggle,
   onSetPlaying,
+  onResume,
   onLevelChange,
   selected,
   onSelect,
   onEdit,
   onDelete,
+  seekStates,
+  onSeekStart,
+  onSeekChange,
+  onSeekEnd,
+  padAudioRef,
+  show,
 }) {
   const headerStyle = {
     background: "rgba(0,0,0,.18)",
@@ -2130,14 +2435,44 @@ function PadCard({
       height: 36,
       barWidth: 2,
       normalize: true,
+      backend: "MediaElement",
+      mediaControls: false,
+      autoplay: false,
     });
     // Reflect seeks on the main audio element for this pad
     try {
+      let wasPlayingBeforeSeek = false;
+
+      wsRef.current.on("interaction", () => {
+        // Store whether audio was playing before seek interaction
+        const waveSurferMap = window.waveSurferInstances;
+        if (waveSurferMap) {
+          const padKey = `${sceneId}:${groupKey}:${pad.id}`;
+          const audioRef = padAudioRef.current.get(padKey);
+          if (audioRef) {
+            wasPlayingBeforeSeek = !audioRef.el.paused && !audioRef.el.ended;
+          }
+        }
+      });
+
       wsRef.current.on("seek", (progress) => {
-        const evt = new CustomEvent("padSeek", {
-          detail: { sceneId: sceneId, groupKey, padId: pad.id, progress },
-        });
-        window.dispatchEvent(evt);
+        // Get the audio element
+        const padKey = `${sceneId}:${groupKey}:${pad.id}`;
+        const audioRef = padAudioRef.current.get(padKey);
+
+        if (audioRef && audioRef.el) {
+          // Pause audio during seek
+          audioRef.el.pause();
+
+          // Calculate and set the new time
+          const newTime = progress * audioRef.el.duration;
+          audioRef.el.currentTime = newTime;
+
+          // Resume playback if it was playing before
+          if (wasPlayingBeforeSeek) {
+            audioRef.el.play().catch(() => {});
+          }
+        }
       });
     } catch {}
     try {
@@ -2166,13 +2501,28 @@ function PadCard({
     } catch {}
   }, [pad.level]);
 
-  // Sync waveform progress with pad play/pause (don't play audio through WaveSurfer)
+  // Create a global map to store WaveSurfer instances for progress sync
+  useEffect(() => {
+    if (!wsRef.current) return;
+
+    // Store WaveSurfer instance in global map for progress sync
+    const waveSurferMap = (window.waveSurferInstances =
+      window.waveSurferInstances || new Map());
+    const padKey = `${sceneId}:${groupKey}:${pad.id}`;
+    waveSurferMap.set(padKey, wsRef.current);
+
+    return () => {
+      waveSurferMap.delete(padKey);
+    };
+  }, [sceneId, groupKey, pad.id]);
+
+  // Sync waveform progress with pad play/pause
   useEffect(() => {
     const ws = wsRef.current;
     if (!ws) return;
     try {
       if (pad.playing) {
-        // Just seek to start for visualization - don't play audio
+        // Just seek to start for visualization - progress will be synced manually
         try {
           ws.seekTo?.(0);
         } catch {}
@@ -2270,20 +2620,7 @@ function PadCard({
                         e.stopPropagation();
                         console.log("Resume button clicked for pad:", pad.id);
                         // Resume from current position
-                        const scene = currentSceneRef.current;
-                        if (scene) {
-                          const padRef = findPad(scene, groupKey, pad.id);
-                          if (padRef) {
-                            console.log("Found pad, calling resumePad");
-                            resumePad(scene.id, groupKey, padRef);
-                            setPadPlaying(groupKey, pad.id, true, null, true);
-                            setStatus(`${pad.label || pad.name} resumed`);
-                          } else {
-                            console.log("Pad not found in scene");
-                          }
-                        } else {
-                          console.log("No current scene found");
-                        }
+                        onResume?.();
                       }}
                     >
                       Resume
@@ -2315,6 +2652,56 @@ function PadCard({
                   onChange={(e) => {
                     onLevelChange(Number(e.target.value));
                   }}
+                />
+              </div>
+              {/* External Seek Bar */}
+              <div className="seekBarContainer">
+                <input
+                  type="range"
+                  className="seekBar"
+                  min="0"
+                  max="1"
+                  step="0.001"
+                  value={(() => {
+                    const padSeekKey = `${sceneId}:${groupKey}:${pad.id}`;
+                    const seekState = seekStates[padSeekKey];
+                    if (seekState && seekState.isSeeking) {
+                      return seekState.progress || 0;
+                    }
+                    // Get current progress from audio element if playing
+                    const key = `${sceneId}:${groupKey}:${pad.id}`;
+                    const ref = padAudioRef.current.get(key);
+                    if (ref && ref.el && ref.el.duration > 0) {
+                      return ref.el.currentTime / ref.el.duration;
+                    }
+                    return 0;
+                  })()}
+                  onMouseDown={() => onSeekStart?.(sceneId, groupKey, pad.id)}
+                  onChange={(e) =>
+                    onSeekChange?.(
+                      sceneId,
+                      groupKey,
+                      pad.id,
+                      Number(e.target.value)
+                    )
+                  }
+                  onMouseUp={(e) =>
+                    onSeekEnd?.(
+                      sceneId,
+                      groupKey,
+                      pad.id,
+                      Number(e.target.value)
+                    )
+                  }
+                  onKeyUp={(e) =>
+                    onSeekEnd?.(
+                      sceneId,
+                      groupKey,
+                      pad.id,
+                      Number(e.target.value)
+                    )
+                  }
+                  disabled={!pad.playing && !pad.assetUrl && !pad.assetPath}
                 />
               </div>
             </>
