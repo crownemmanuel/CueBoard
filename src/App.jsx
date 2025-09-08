@@ -114,6 +114,62 @@ function App() {
   const [midiOut, setMidiOut] = useState(null);
   const [midiOutName, setMidiOutName] = useState("Offline");
   const apcInitedRef = useRef(false);
+  // APC40 mkII top encoder and ring control CCs (as per sample HTML5 app)
+  const APC_TRACK_KNOB_CC = useRef([
+    0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37,
+  ]);
+  const APC_TRACK_RINGTYPE_CC = useRef([
+    0x38, 0x39, 0x3a, 0x3b, 0x3c, 0x3d, 0x3e, 0x3f,
+  ]);
+  const APC_DEVICE_KNOB_CC = useRef([
+    0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+  ]);
+  const APC_DEVICE_RINGTYPE_CC = useRef([
+    0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
+  ]);
+  const APC_ALT_RINGTYPE_A = useRef([
+    0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47,
+  ]);
+  const APC_ALT_RINGTYPE_B = useRef([
+    0x48, 0x49, 0x4a, 0x4b, 0x4c, 0x4d, 0x4e, 0x4f,
+  ]);
+
+  function apcSendCC(cc, value, channel = 0) {
+    if (!midiOut) return;
+    const status = 0xb0 | (channel & 0x0f);
+    try {
+      midiOut.send([status & 0xff, cc & 0x7f, value & 0x7f]);
+    } catch {}
+  }
+
+  function apcSetRingTypeAll(type /*0 off,1 single,2 volume,3 pan*/) {
+    // Broadcast to candidate CC maps and channels 1..8, mirroring sample app's robustness
+    const sets = [
+      APC_TRACK_RINGTYPE_CC.current,
+      APC_DEVICE_RINGTYPE_CC.current,
+      APC_ALT_RINGTYPE_A.current,
+      APC_ALT_RINGTYPE_B.current,
+    ];
+    sets.forEach((set) => {
+      for (let ch = 0; ch < 8; ch++) {
+        for (let i = 0; i < 8; i++) {
+          const cc = set[i];
+          if (typeof cc === "number") apcSendCC(cc, type, ch);
+        }
+      }
+    });
+  }
+
+  function apcSendKnobValue(index /*0..7*/, ccValue /*0..127*/, channel = 0) {
+    const cc = APC_TRACK_KNOB_CC.current[index];
+    if (typeof cc !== "number") return;
+    apcSendCC(cc, ccValue, channel);
+  }
+
+  function volumeToCc(vol /*0..1*/) {
+    const clamped = Math.max(0, Math.min(1, Number(vol) || 0));
+    return Math.round(clamped * 127);
+  }
   const audioCtxRef = useRef(null);
   const padAudioRef = useRef(new Map());
   const apcNoteToPadRef = useRef(new Map());
@@ -229,6 +285,12 @@ function App() {
               handleApcFader(ch, d2);
               return;
             }
+            // Handle CC for top encoders (absolute 0..127 on CC 0x30..0x37)
+            if (statusHi === 0xb0 && d1 >= 0x30 && d1 <= 0x37) {
+              const idx = d1 - 0x30; // 0..7
+              handleApcEncoder(idx, d2);
+              return;
+            }
             // Note On with velocity > 0
             if (statusHi === 0x90 && d2 > 0) {
               const note = d1 | 0; // 0..127
@@ -244,6 +306,10 @@ function App() {
                       note & 0x7f,
                       5, // red velocity
                     ]);
+                  } catch {}
+                  // Sync knob rings to reflect active group's levels
+                  try {
+                    syncKnobRingsForActiveGroup();
                   } catch {}
                 }
                 return;
@@ -333,6 +399,10 @@ function App() {
           vel & 0x7f,
         ]);
       });
+    } catch {}
+    // When active group changes, update knob rings to reflect levels
+    try {
+      syncKnobRingsForActiveGroup();
     } catch {}
   }, [activeGroupKey, midiOut]);
 
@@ -541,6 +611,10 @@ function App() {
       midiOut.send(apcInitSysexMsg());
       apcInitedRef.current = true;
       setStatus((s) => `${s} — APC inited`);
+      // Ensure knob rings are in Volume style (bar fill), mirroring the sample app
+      try {
+        apcSetRingTypeAll(2);
+      } catch {}
       // Also refresh group selection LED state upon init
       GROUP_SELECT_NOTES.forEach((n) => {
         const isActive = NOTE_TO_GROUP_KEY[n] === activeGroupKey;
@@ -554,12 +628,41 @@ function App() {
           ]);
         } catch {}
       });
+      // Light knob rings to current active group's first 8 pad levels
+      try {
+        syncKnobRingsForActiveGroup();
+      } catch {}
     } catch {}
   }
 
   // Convert CC value (0..127) to linear volume 0..1
   function ccToVolume(cc) {
     return Math.max(0, Math.min(1, cc / 127));
+  }
+
+  // Map encoder index (0..7) to pad for active group
+  function getPadForEncoder(index /*0..7*/) {
+    const scene = currentSceneRef.current;
+    const groupKey = activeGroupRef.current;
+    if (!scene || !groupKey) return null;
+    const arr = groupArray(scene, groupKey) || [];
+    if (index < 0 || index >= 8) return null;
+    const pad = arr[index];
+    if (!pad) return null;
+    return { pad, groupKey };
+  }
+
+  // Encoder handler: apply value immediately (direct mapping like sample)
+  function handleApcEncoder(index /*0..7*/, value /*0..127*/) {
+    const target = getPadForEncoder(index);
+    if (!target) return;
+    const { pad, groupKey } = target;
+    const desired = ccToVolume(value);
+    setPadLevel(groupKey, pad.id, desired);
+    // Echo ring LED immediately
+    try {
+      apcSendKnobValue(index, value);
+    } catch {}
   }
 
   // Map channel (1..8) and current active group to the pad in that column
@@ -609,6 +712,10 @@ function App() {
     initApcIfNeeded();
     // Clear first to avoid stale LEDs
     clearAllApcLeds(0);
+    // Ensure ring type on each render of scene to keep in sync
+    try {
+      apcSetRingTypeAll(2);
+    } catch {}
     try {
       apcNoteToPadRef.current = new Map();
     } catch {}
@@ -649,6 +756,24 @@ function App() {
         ]);
       });
     } catch {}
+
+    // Sync the knob rings to reflect active group's first 8 pad levels
+    try {
+      syncKnobRingsForActiveGroup();
+    } catch {}
+  }
+
+  function syncKnobRingsForActiveGroup() {
+    if (!midiOut) return;
+    const scene = currentSceneRef.current;
+    const groupKey = activeGroupRef.current;
+    if (!scene || !groupKey) return;
+    const arr = groupArray(scene, groupKey) || [];
+    for (let i = 0; i < 8; i++) {
+      const p = arr[i];
+      const level = typeof p?.level === "number" ? p.level : 0;
+      apcSendKnobValue(i, volumeToCc(level));
+    }
   }
 
   function handleApcPadPress(note /*0..39*/) {
@@ -1486,6 +1611,18 @@ function App() {
       updateScene(updater);
     }
     applyPadVolume(targetSceneId, groupKey, id, value);
+    // If this pad is within the first 8 of the active group, echo the ring LED
+    try {
+      const scene = currentSceneRef.current;
+      const group = activeGroupRef.current;
+      if (scene && group && group === groupKey) {
+        const arr = groupArray(scene, groupKey) || [];
+        const idx = arr.findIndex((p) => p.id === id);
+        if (idx >= 0 && idx < 8) {
+          apcSendKnobValue(idx, volumeToCc(value));
+        }
+      }
+    } catch {}
     try {
       const sc =
         (show.scenes || []).find((s) => s.id === targetSceneId) || currentScene;
