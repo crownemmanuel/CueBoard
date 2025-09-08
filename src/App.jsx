@@ -1409,16 +1409,45 @@ function App() {
     }
     if (!list || list.length === 0) return;
 
-    const findSceneById = (sid) =>
-      (show.scenes || []).find((s) => s.id === sid);
+    const findSceneById = (sid) => {
+      // Use showRef for more reliable access to latest scenes
+      const currentShow = showRef.current || show;
+      const foundScene = (currentShow.scenes || []).find((s) => s.id === sid);
+      if (!foundScene) {
+        console.log(
+          `Scene ${sid} not found in ${
+            currentShow.scenes?.length || 0
+          } scenes:`,
+          currentShow.scenes?.map((s) => s.id)
+        );
+      } else {
+        console.log(`Scene ${sid} found: ${foundScene.name}`);
+      }
+      return foundScene;
+    };
 
     list.forEach((t) => {
       if (!t || t.action === "none") return;
-      const targetScene = findSceneById(t.sceneId || scene.id) || scene;
+
+      const targetSceneId = t.sceneId || scene.id;
+      const targetScene = findSceneById(targetSceneId) || scene;
       const targetPadId = t.padId || pad.id;
+
+      console.log(
+        `Trigger: ${t.action} from scene ${scene.id} pad ${pad.id} to scene ${targetSceneId} pad ${targetPadId}`
+      );
+
       const found = findPadByAny(targetScene, targetPadId);
-      if (!found) return;
+      if (!found) {
+        console.log(
+          `Trigger failed: Could not find pad ${targetPadId} in scene ${targetScene.id}`
+        );
+        return;
+      }
       const [gk, p] = found;
+      console.log(
+        `Trigger executing: ${t.action} on ${gk}:${p.id} (${p.name || p.label})`
+      );
       if (t.action === "play") {
         setPadPlaying(gk, p.id, true, targetScene.id);
       } else if (t.action === "stop") {
@@ -3071,12 +3100,32 @@ function findPadByAny(scene, padId) {
   const gk1 = "background";
   const gk2 = "ambients";
   const gk3 = "sfx";
+
+  console.log(`Looking for pad ${padId} in scene ${scene.id} (${scene.name})`);
+
   const p1 = scene.background.find((p) => p.id === padId);
-  if (p1) return [gk1, p1];
+  if (p1) {
+    console.log(`Found pad ${padId} in background: ${p1.name || p1.label}`);
+    return [gk1, p1];
+  }
   const p2 = scene.ambients.find((p) => p.id === padId);
-  if (p2) return [gk2, p2];
+  if (p2) {
+    console.log(`Found pad ${padId} in ambients: ${p2.name || p2.label}`);
+    return [gk2, p2];
+  }
   const p3 = scene.sfx.find((p) => p.id === padId);
-  if (p3) return [gk3, p3];
+  if (p3) {
+    console.log(`Found pad ${padId} in sfx: ${p3.name || p3.label}`);
+    return [gk3, p3];
+  }
+
+  console.log(
+    `Pad ${padId} not found in scene ${scene.id}. Available pads:`,
+    [...scene.background, ...scene.ambients, ...scene.sfx].map(
+      (p) => `${p.id}: ${p.name || p.label}`
+    )
+  );
+
   return null;
 }
 
@@ -4399,24 +4448,37 @@ function SoundEditorDrawer({
                       }
                     >
                       {(() => {
+                        const targetSceneId = tr.sceneId || scene.id;
                         const s =
-                          (scenes || []).find(
-                            (s) => s.id === (tr.sceneId || scene.id)
-                          ) || scene;
+                          (scenes || []).find((s) => s.id === targetSceneId) ||
+                          scene;
+                        console.log(
+                          `Trigger config: Looking for pads in scene ${targetSceneId}, found scene: ${s.id} (${s.name})`
+                        );
                         const pads = [
                           ...(s.background || []),
                           ...(s.ambients || []),
                           ...(s.sfx || []),
                         ];
+                        console.log(
+                          `Trigger config: Found ${pads.length} pads in scene ${s.id}`
+                        );
                         return [
                           <option key="" value="">
                             Select pad
                           </option>,
-                          ...pads.map((p) => (
-                            <option key={p.id} value={p.id}>
-                              {p.name || p.label || p.id}
-                            </option>
-                          )),
+                          ...pads.map((p) => {
+                            console.log(
+                              `Trigger config pad: ${p.id} - ${
+                                p.name || p.label
+                              }`
+                            );
+                            return (
+                              <option key={p.id} value={p.id}>
+                                {p.name || p.label || p.id}
+                              </option>
+                            );
+                          }),
                         ];
                       })()}
                     </select>
