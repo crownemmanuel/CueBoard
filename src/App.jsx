@@ -773,6 +773,19 @@ function App() {
     } catch {}
   }
 
+  function fadeVolume(sceneId, groupKey, padId, from, to, ms, onDone) {
+    const steps = Math.max(1, Math.floor(Math.max(0, ms) / 16));
+    let i = 0;
+    const step = () => {
+      const v = from + (to - from) * (i / steps);
+      applyPadVolume(sceneId, groupKey, padId, v);
+      i++;
+      if (i <= steps) requestAnimationFrame(step);
+      else onDone && onDone();
+    };
+    requestAnimationFrame(step);
+  }
+
   function stopAllAudio() {
     try {
       padAudioRef.current.forEach((ref, key) => {
@@ -838,8 +851,6 @@ function App() {
         t.action === "fadeOut"
       ) {
         const ms = Math.max(0, Number.isFinite(t.timeMs) ? t.timeMs : 200);
-        const steps = Math.max(1, Math.floor(ms / 16));
-
         const targetLevel =
           typeof p.baseLevel === "number"
             ? p.baseLevel
@@ -847,52 +858,42 @@ function App() {
             ? p.level
             : 0.8;
 
-        const fadeDown = () => {
-          const from = p.level ?? targetLevel;
-          let i = 0;
-          const step = () => {
-            const v = from * (1 - i / steps);
-            setPadLevel(gk, p.id, v, targetScene.id);
-            i++;
-            if (i <= steps) requestAnimationFrame(step);
-            else {
-              setPadPlaying(gk, p.id, false, targetScene.id);
-              if (targetScene.id !== currentScene.id) {
-                stopPad(targetScene.id, gk, p.id);
-              }
-            }
-          };
-          requestAnimationFrame(step);
+        const key = padKey(targetScene.id, gk, p.id);
+        const ref = padAudioRef.current.get(key);
+        const currentVol = ref ? ref.el.volume : targetLevel;
+
+        const doFadeOut = () => {
+          if (!ref) return; // nothing to fade
+          fadeVolume(targetScene.id, gk, p.id, currentVol, 0, ms, () => {
+            setPadPlaying(gk, p.id, false, targetScene.id);
+          });
         };
 
-        const fadeUp = () => {
-          // Ensure it is playing and start from 0 if currently silent
+        const doFadeIn = () => {
           if (!p.playing) {
-            setPadLevel(gk, p.id, 0, targetScene.id);
             setPadPlaying(gk, p.id, true, targetScene.id);
-            if (targetScene.id !== currentScene.id) {
-              playPad(targetScene.id, gk, p);
-            }
           }
-          const from = p.level ?? 0;
-          let i = 0;
-          const step = () => {
-            const v = from + (targetLevel - from) * (i / steps);
-            setPadLevel(gk, p.id, v, targetScene.id);
-            i++;
-            if (i <= steps) requestAnimationFrame(step);
+          // Ensure audio ref exists, then force to 0 and fade up
+          const ensure = () => {
+            const r = padAudioRef.current.get(key);
+            if (!r) {
+              requestAnimationFrame(ensure);
+              return;
+            }
+            applyPadVolume(targetScene.id, gk, p.id, 0);
+            fadeVolume(targetScene.id, gk, p.id, 0, targetLevel, ms);
           };
-          requestAnimationFrame(step);
+          ensure();
         };
 
         if (t.action === "fadeOut") {
-          if (p.playing) fadeDown();
+          doFadeOut();
         } else if (t.action === "fadeIn") {
-          fadeUp();
+          doFadeIn();
         } else {
-          // Backward-compatibility: decide direction based on current state
-          if (p.playing) fadeDown();
-          else fadeUp();
+          // Legacy 'fade': pick direction based on current playing state
+          if (p.playing) doFadeOut();
+          else doFadeIn();
         }
       }
     });
@@ -3486,7 +3487,7 @@ function SoundEditorDrawer({
                       <option value="none">None</option>
                       <option value="play">Play</option>
                       <option value="stop">Stop</option>
-                      <option value="fade">Fade (auto)</option>
+                      {/* Legacy 'fade' removed from UI per request */}
                       <option value="fadeIn">Fade In</option>
                       <option value="fadeOut">Fade Out</option>
                     </select>
