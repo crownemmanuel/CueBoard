@@ -2122,7 +2122,6 @@ function App() {
       (currentSceneRef.current && currentSceneRef.current.id) ||
       currentScene.id;
 
-    let updatedScene = null;
     const updater = (scene) => {
       const pad = findPad(scene, groupKey, id);
       if (!pad) return scene;
@@ -2152,7 +2151,6 @@ function App() {
         const shouldUsePause = !playing;
         handlePadAudio(scene, groupKey, pad, !!playing, shouldUsePause);
       }
-      updatedScene = scene; // Capture the updated scene for triggers
       return scene;
     };
 
@@ -2164,15 +2162,27 @@ function App() {
       updateSceneById(targetSceneId, updater);
     else updateScene(updater);
 
-    // Fire triggers for this pad state change using the updated scene
+    // Fire triggers for this pad state change
     try {
-      const sc =
-        updatedScene || // Use the scene that was just updated
-        (show.scenes || []).find((s) => s.id === targetSceneId) ||
-        currentSceneRef.current ||
-        currentScene;
-      const pad = findPad(sc, groupKey, id);
-      if (pad) runPadTriggers(sc, pad, playing ? "onStart" : "onStop");
+      // For cross-scene triggers, we need to find the correct scene after the update
+      // Since React state updates are async, we try multiple approaches
+      let targetScene = null;
+
+      // First try to find the updated scene from show.scenes
+      targetScene = (show.scenes || []).find((s) => s.id === targetSceneId);
+
+      // Fallback to refs
+      if (!targetScene) {
+        targetScene = currentSceneRef.current;
+      }
+
+      // Final fallback to computed current scene
+      if (!targetScene) {
+        targetScene = currentScene;
+      }
+
+      const pad = findPad(targetScene, groupKey, id);
+      if (pad) runPadTriggers(targetScene, pad, playing ? "onStart" : "onStop");
     } catch {}
   }
 
