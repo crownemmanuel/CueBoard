@@ -1284,6 +1284,15 @@ function PadCard({
     } catch {}
   }, [pad.playing, pad.level, pad.fadeInMs, pad.fadeOutMs]);
 
+  // Apply volume changes immediately to WaveSurfer when level changes
+  useEffect(() => {
+    const ws = wsRef.current;
+    if (!ws) return;
+    try {
+      ws.setVolume?.(pad.level || 0);
+    } catch {}
+  }, [pad.level]);
+
   const handleContextMenu = (e) => {
     e.preventDefault();
     if (mode !== "edit") return;
