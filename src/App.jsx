@@ -1081,7 +1081,7 @@ function PadCard({
         const fadeMs = typeof pad.fadeInMs === "number" ? pad.fadeInMs : 0;
         if (fadeMs > 0) {
           ws.setVolume?.(0);
-          ws.play?.();
+          ws.play?.(0);
           const t0 = performance.now();
           const step = (t) => {
             const p = Math.min(1, (t - t0) / fadeMs);
@@ -1094,7 +1094,7 @@ function PadCard({
           requestAnimationFrame(step);
         } else {
           ws.setVolume?.(target);
-          ws.play?.();
+          ws.play?.(0);
         }
       } else if (!pad.playing && isPlaying) {
         const startVol =
@@ -1219,7 +1219,7 @@ function PadCard({
                             typeof pad.fadeInMs === "number" ? pad.fadeInMs : 0;
                           if (fadeMs > 0) {
                             ws.setVolume?.(0);
-                            ws.play?.();
+                            ws.play?.(0);
                             const t0 = performance.now();
                             const step = (t) => {
                               const p = Math.min(1, (t - t0) / fadeMs);
@@ -1232,7 +1232,7 @@ function PadCard({
                             requestAnimationFrame(step);
                           } else {
                             ws.setVolume?.(target);
-                            ws.play?.();
+                            ws.play?.(0);
                           }
                         } catch {}
                       }
