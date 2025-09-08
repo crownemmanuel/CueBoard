@@ -2644,66 +2644,7 @@ function SettingsModal({ settings, scene, onUpdateSettings, onUpdatePadRoute, on
             </div>
           </div>
 
-          <div style={{ margin: "16px 0", color: "#bbb" }}>Per-Pad Routing (Current Scene)</div>
-          <div className="rowFlex">
-            <div className="field" style={{ flex: 1 }}>
-              <label>Background</label>
-              {(scene?.background || []).map((p) => (
-                <div key={p.id} className="rowFlex" style={{ gap: 6, marginBottom: 6 }}>
-                  <div style={{ width: 140, color: "#ddd" }}>{p.label || p.name}</div>
-                  <select
-                    style={{ flex: 1 }}
-                    value={p.routeKey || "master"}
-                    onChange={(e) => onUpdatePadRoute?.("background", p.id, e.target.value)}
-                  >
-                    {outputs.map((o) => (
-                      <option key={o.key} value={o.key}>
-                        {o.label}
-                      </option>
-                    ))}
-                  </select>
-                </div>
-              ))}
-            </div>
-            <div className="field" style={{ flex: 1 }}>
-              <label>Ambient</label>
-              {(scene?.ambients || []).map((p) => (
-                <div key={p.id} className="rowFlex" style={{ gap: 6, marginBottom: 6 }}>
-                  <div style={{ width: 140, color: "#ddd" }}>{p.label || p.name}</div>
-                  <select
-                    style={{ flex: 1 }}
-                    value={p.routeKey || "master"}
-                    onChange={(e) => onUpdatePadRoute?.("ambients", p.id, e.target.value)}
-                  >
-                    {outputs.map((o) => (
-                      <option key={o.key} value={o.key}>
-                        {o.label}
-                      </option>
-                    ))}
-                  </select>
-                </div>
-              ))}
-            </div>
-            <div className="field" style={{ flex: 1 }}>
-              <label>SFX</label>
-              {(scene?.sfx || []).map((p) => (
-                <div key={p.id} className="rowFlex" style={{ gap: 6, marginBottom: 6 }}>
-                  <div style={{ width: 140, color: "#ddd" }}>{p.label || p.name}</div>
-                  <select
-                    style={{ flex: 1 }}
-                    value={p.routeKey || "master"}
-                    onChange={(e) => onUpdatePadRoute?.("sfx", p.id, e.target.value)}
-                  >
-                    {outputs.map((o) => (
-                      <option key={o.key} value={o.key}>
-                        {o.label}
-                      </option>
-                    ))}
-                  </select>
-                </div>
-              ))}
-            </div>
-          </div>
+          {/* Per-Pad Routing removed: moved to per-pad editor to reduce clutter */}
           {/* Audio Test Player removed per UI cleanup */}
           <div style={{ margin: "16px 0", color: "#bbb" }}>MIDI (Web MIDI)</div>
           <div className="rowFlex">
