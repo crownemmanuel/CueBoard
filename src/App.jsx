@@ -399,6 +399,16 @@ function App() {
     }));
   }
 
+  // Update a specific scene by id (used by cross-scene triggers)
+  function updateSceneById(sceneId, mutator) {
+    setShow((prev) => ({
+      ...prev,
+      scenes: prev.scenes.map((s) =>
+        s.id === sceneId ? mutator(structuredClone(s)) : s
+      ),
+    }));
+  }
+
   function togglePadPlayByKey(key) {
     const [group, id] = key.split(":");
     updateScene((scene) => {
@@ -664,10 +674,8 @@ function App() {
     if (!pad.assetUrl && !pad.assetPath) return;
     if (shouldPlay) {
       playPad(scene.id, groupKey, pad);
-      runPadTriggers(scene, pad, "onStart");
     } else {
       stopPad(scene.id, groupKey, pad.id);
-      runPadTriggers(scene, pad, "onStop");
     }
   }
 
@@ -745,37 +753,90 @@ function App() {
   }
 
   function runPadTriggers(scene, pad, phase) {
-    const t = pad.triggers?.[phase];
-    if (!t || t.action === "none") return;
-    const parts = (t.target || "").split(":");
-    const targetScene = scene;
-    const doFade = (p, ms, db) => {
-      const id = p.id;
-      const groupKey = p.groupKey || inferGroupKey(targetScene, id);
-      if (!groupKey) return;
-      const from = p.level ?? 0.8;
-      const to = clamp01(dbToLinear(linearToDb(from) + (db || -12)));
-      const steps = Math.max(1, Math.floor((ms || 200) / 16));
-      let i = 0;
-      const tick = () => {
-        const v = from + (to - from) * (i / steps);
-        setPadLevel(groupKey, id, v);
-        i++;
-        if (i <= steps) requestAnimationFrame(tick);
-      };
-      tick();
-    };
-    if (t.targetType === "pad" && parts.length >= 1) {
-      const pid = parts[0] || pad.id;
-      const [gk, p] = findPadByAny(targetScene, pid) || [];
-      if (!p || !gk) return;
-      if (t.action === "play") togglePadPlay(gk, p.id);
-      else if (t.action === "stop") {
-        if (p.playing) togglePadPlay(gk, p.id);
-      } else if (t.action === "fade") {
-        doFade(p, t.timeMs, t.amountDb);
+    // New array-based triggers, with legacy fallback
+    let list = [];
+    const legacy =
+      pad.triggers && !Array.isArray(pad.triggers) ? pad.triggers : null;
+    if (Array.isArray(pad.triggers)) {
+      list = (pad.triggers || []).filter((tr) => tr && tr.phase === phase);
+    } else if (legacy && legacy[phase]) {
+      const t = legacy[phase];
+      if (t && t.action && t.action !== "none") {
+        const parts = String(t.target || "").split(":");
+        list = [
+          {
+            id: `trg-${Math.random().toString(36).slice(2, 8)}`,
+            phase,
+            action: t.action,
+            sceneId: parts.length > 1 ? parts[0] : scene.id,
+            padId: parts.length > 1 ? parts[1] : parts[0] || pad.id,
+            timeMs: typeof t.timeMs === "number" ? t.timeMs : 200,
+          },
+        ];
       }
     }
+    if (!list || list.length === 0) return;
+
+    const findSceneById = (sid) =>
+      (show.scenes || []).find((s) => s.id === sid);
+
+    list.forEach((t) => {
+      if (!t || t.action === "none") return;
+      const targetScene = findSceneById(t.sceneId || scene.id) || scene;
+      const targetPadId = t.padId || pad.id;
+      const found = findPadByAny(targetScene, targetPadId);
+      if (!found) return;
+      const [gk, p] = found;
+      if (t.action === "play") {
+        setPadPlaying(gk, p.id, true, targetScene.id);
+        if (targetScene.id !== currentScene.id) {
+          playPad(targetScene.id, gk, p);
+        }
+      } else if (t.action === "stop") {
+        setPadPlaying(gk, p.id, false, targetScene.id);
+        if (targetScene.id !== currentScene.id) {
+          stopPad(targetScene.id, gk, p.id);
+        }
+      } else if (t.action === "fade") {
+        const ms = Math.max(0, Number.isFinite(t.timeMs) ? t.timeMs : 200);
+        const steps = Math.max(1, Math.floor(ms / 16));
+        if (p.playing) {
+          const from = p.level ?? 0.8;
+          let i = 0;
+          const down = () => {
+            const v = from * (1 - i / steps);
+            setPadLevel(gk, p.id, v, targetScene.id);
+            i++;
+            if (i <= steps) requestAnimationFrame(down);
+            else {
+              setPadPlaying(gk, p.id, false, targetScene.id);
+              if (targetScene.id !== currentScene.id)
+                stopPad(targetScene.id, gk, p.id);
+            }
+          };
+          requestAnimationFrame(down);
+        } else {
+          const targetLevel =
+            typeof p.baseLevel === "number"
+              ? p.baseLevel
+              : typeof p.level === "number"
+              ? p.level
+              : 0.8;
+          setPadLevel(gk, p.id, 0, targetScene.id);
+          setPadPlaying(gk, p.id, true, targetScene.id);
+          if (targetScene.id !== currentScene.id)
+            playPad(targetScene.id, gk, p);
+          let i = 0;
+          const up = () => {
+            const v = targetLevel * (i / steps);
+            setPadLevel(gk, p.id, v, targetScene.id);
+            i++;
+            if (i <= steps) requestAnimationFrame(up);
+          };
+          requestAnimationFrame(up);
+        }
+      }
+    });
   }
 
   // --- Persistence: export/import & relink ---
@@ -1273,6 +1334,7 @@ function App() {
           editor={editor}
           scene={currentScene}
           groups={show.groups}
+          scenes={show.scenes}
           onClose={() =>
             setEditor({ open: false, groupKey: null, padId: null })
           }
@@ -1291,32 +1353,55 @@ function App() {
         setStatus("No audio attached to this pad");
         return scene;
       }
-      pad.playing = !pad.playing;
-      setStatus(
-        `${pad.label || pad.name} ${pad.playing ? "started" : "stopped"}`
-      );
+      const next = !pad.playing;
+      setPadPlaying(groupKey, id, next);
+      setStatus(`${pad.label || pad.name} ${next ? "started" : "stopped"}`);
       return scene;
     });
   }
 
-  function setPadLevel(groupKey, id, value) {
-    updateScene((scene) => {
+  function setPadLevel(groupKey, id, value, sceneIdOverride) {
+    const targetSceneId = sceneIdOverride || currentScene.id;
+    const updater = (scene) => {
       const pad = findPad(scene, groupKey, id);
       if (!pad) return scene;
       pad.level = value;
-      applyPadVolume(currentScene.id, groupKey, id, value);
-      setStatus(`${pad.label || pad.name} level ${(value * 100) | 0}%`);
       return scene;
-    });
+    };
+    if (targetSceneId !== currentScene.id) {
+      updateSceneById(targetSceneId, updater);
+    } else {
+      updateScene(updater);
+    }
+    applyPadVolume(targetSceneId, groupKey, id, value);
+    try {
+      const sc =
+        (show.scenes || []).find((s) => s.id === targetSceneId) || currentScene;
+      const pad = findPad(sc, groupKey, id);
+      if (pad)
+        setStatus(`${pad.label || pad.name} level ${(value * 100) | 0}%`);
+    } catch {}
   }
 
-  function setPadPlaying(groupKey, id, playing) {
-    updateScene((scene) => {
+  function setPadPlaying(groupKey, id, playing, sceneIdOverride) {
+    const targetSceneId = sceneIdOverride || currentScene.id;
+    const updater = (scene) => {
       const pad = findPad(scene, groupKey, id);
       if (!pad) return scene;
       pad.playing = !!playing;
       return scene;
-    });
+    };
+    if (targetSceneId !== currentScene.id)
+      updateSceneById(targetSceneId, updater);
+    else updateScene(updater);
+    // Fire triggers for this pad state change
+    try {
+      const sc =
+        (show.scenes || []).find((s) => s.id === targetSceneId) ||
+        currentSceneRef.current;
+      const pad = findPad(sc, groupKey, id);
+      if (pad) runPadTriggers(sc, pad, playing ? "onStart" : "onStop");
+    } catch {}
   }
 
   function openEditor(groupKey, id) {
@@ -2877,21 +2962,36 @@ function SoundEditorDrawer({ editor, scene, groups, onClose, onSave }) {
       ? pad.groupId
       : editor.groupKey
   );
-  const [triggers, setTriggers] = useState({
-    onStart: {
-      action: "none",
-      targetType: "pad",
-      target: "",
-      timeMs: 200,
-      amountDb: -12,
-    },
-    onStop: {
-      action: "none",
-      targetType: "pad",
-      target: "",
-      timeMs: 200,
-      amountDb: -12,
-    },
+  const [triggers, setTriggers] = useState(() => {
+    if (Array.isArray(pad?.triggers)) {
+      return pad.triggers;
+    }
+    if (pad?.triggers && typeof pad.triggers === "object") {
+      const legacy = pad.triggers;
+      const coerce = (phase, t) => ({
+        id: `trg-${Math.random().toString(36).slice(2, 8)}`,
+        phase,
+        action: t?.action || "none",
+        sceneId: t?.sceneId || scene.id,
+        padId: t?.padId || pad?.id || "",
+        timeMs: typeof t?.timeMs === "number" ? t.timeMs : 200,
+      });
+      const arr = [];
+      if (legacy.onStart) arr.push(coerce("onStart", legacy.onStart));
+      if (legacy.onStop) arr.push(coerce("onStop", legacy.onStop));
+      return arr;
+    }
+    return [];
+  });
+
+  const ensureTrigger = (overrides = {}) => ({
+    id: `trg-${Math.random().toString(36).slice(2, 8)}`,
+    phase: "onStart", // or "onStop"
+    action: "none", // none | play | stop | fade
+    sceneId: scene.id,
+    padId: pad?.id || "",
+    timeMs: 200,
+    ...overrides,
   });
 
   return (
@@ -3057,150 +3157,142 @@ function SoundEditorDrawer({ editor, scene, groups, onClose, onSave }) {
           </div>
           <div style={{ margin: "8px 0", color: "#bbb" }}>Triggers</div>
           <div className="field">
-            <label>onStart</label>
-            <div className="rowFlex">
-              <select
-                value={triggers.onStart.action}
-                onChange={(e) =>
-                  setTriggers((t) => ({
-                    ...t,
-                    onStart: { ...t.onStart, action: e.target.value },
-                  }))
-                }
-              >
-                <option value="none">None</option>
-                <option value="play">Play</option>
-                <option value="stop">Stop</option>
-                <option value="fade">Fade</option>
-              </select>
-              <select
-                value={triggers.onStart.targetType}
-                onChange={(e) =>
-                  setTriggers((t) => ({
-                    ...t,
-                    onStart: { ...t.onStart, targetType: e.target.value },
-                  }))
-                }
-              >
-                <option value="pad">Pad</option>
-                <option value="group">Group</option>
-                <option value="scene">Scene</option>
-              </select>
-              <input
-                placeholder="target (sceneId:padId or group name)"
-                value={triggers.onStart.target}
-                onChange={(e) =>
-                  setTriggers((t) => ({
-                    ...t,
-                    onStart: { ...t.onStart, target: e.target.value },
-                  }))
-                }
-              />
-            </div>
-            <div className="rowFlex">
-              <div className="field">
-                <label>Time (ms)</label>
-                <input
-                  type="number"
-                  placeholder="200"
-                  value={triggers.onStart.timeMs}
-                  onChange={(e) =>
-                    setTriggers((t) => ({
-                      ...t,
-                      onStart: { ...t.onStart, timeMs: Number(e.target.value) },
-                    }))
-                  }
-                />
+            {triggers.length === 0 && (
+              <div style={{ color: "#888", marginBottom: 8 }}>No triggers</div>
+            )}
+            {triggers.map((tr) => (
+              <div key={tr.id} className="triggerRow">
+                <div className="rowFlex">
+                  <div className="field">
+                    <label>Phase</label>
+                    <select
+                      value={tr.phase}
+                      onChange={(e) =>
+                        setTriggers((arr) =>
+                          arr.map((x) =>
+                            x.id === tr.id ? { ...x, phase: e.target.value } : x
+                          )
+                        )
+                      }
+                    >
+                      <option value="onStart">On Start</option>
+                      <option value="onStop">On Stop</option>
+                    </select>
+                  </div>
+                  <div className="field">
+                    <label>Action</label>
+                    <select
+                      value={tr.action}
+                      onChange={(e) =>
+                        setTriggers((arr) =>
+                          arr.map((x) =>
+                            x.id === tr.id
+                              ? { ...x, action: e.target.value }
+                              : x
+                          )
+                        )
+                      }
+                    >
+                      <option value="none">None</option>
+                      <option value="play">Play</option>
+                      <option value="stop">Stop</option>
+                      <option value="fade">Fade</option>
+                    </select>
+                  </div>
+                  <div className="field">
+                    <label>Scene</label>
+                    <select
+                      value={tr.sceneId || scene.id}
+                      onChange={(e) =>
+                        setTriggers((arr) =>
+                          arr.map((x) =>
+                            x.id === tr.id
+                              ? { ...x, sceneId: e.target.value }
+                              : x
+                          )
+                        )
+                      }
+                    >
+                      {(scenes || []).map((s) => (
+                        <option key={s.id} value={s.id}>
+                          {s.name}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                  <div className="field">
+                    <label>Pad</label>
+                    <select
+                      value={tr.padId || ""}
+                      onChange={(e) =>
+                        setTriggers((arr) =>
+                          arr.map((x) =>
+                            x.id === tr.id ? { ...x, padId: e.target.value } : x
+                          )
+                        )
+                      }
+                    >
+                      {(() => {
+                        const s =
+                          (scenes || []).find(
+                            (s) => s.id === (tr.sceneId || scene.id)
+                          ) || scene;
+                        const pads = [
+                          ...(s.background || []),
+                          ...(s.ambients || []),
+                          ...(s.sfx || []),
+                        ];
+                        return [
+                          <option key="" value="">
+                            Select pad
+                          </option>,
+                          ...pads.map((p) => (
+                            <option key={p.id} value={p.id}>
+                              {p.name || p.label || p.id}
+                            </option>
+                          )),
+                        ];
+                      })()}
+                    </select>
+                  </div>
+                  {tr.action === "fade" && (
+                    <div className="field">
+                      <label>Time (ms)</label>
+                      <input
+                        type="number"
+                        value={typeof tr.timeMs === "number" ? tr.timeMs : 200}
+                        onChange={(e) =>
+                          setTriggers((arr) =>
+                            arr.map((x) =>
+                              x.id === tr.id
+                                ? { ...x, timeMs: Number(e.target.value) }
+                                : x
+                            )
+                          )
+                        }
+                      />
+                    </div>
+                  )}
+                  <div className="field" style={{ alignSelf: "flex-end" }}>
+                    <button
+                      className="btn sm red"
+                      onClick={() =>
+                        setTriggers((arr) => arr.filter((x) => x.id !== tr.id))
+                      }
+                    >
+                      Remove
+                    </button>
+                  </div>
+                </div>
               </div>
-              <div className="field">
-                <label>Amount (dB)</label>
-                <input
-                  type="number"
-                  placeholder="-12"
-                  value={triggers.onStart.amountDb}
-                  onChange={(e) =>
-                    setTriggers((t) => ({
-                      ...t,
-                      onStart: {
-                        ...t.onStart,
-                        amountDb: Number(e.target.value),
-                      },
-                    }))
-                  }
-                />
-              </div>
-            </div>
-          </div>
-          <div className="field">
-            <label>onStop</label>
-            <div className="rowFlex">
-              <select
-                value={triggers.onStop.action}
-                onChange={(e) =>
-                  setTriggers((t) => ({
-                    ...t,
-                    onStop: { ...t.onStop, action: e.target.value },
-                  }))
-                }
+            ))}
+            <div>
+              <button
+                className="btn sm"
+                onClick={() => setTriggers((arr) => [...arr, ensureTrigger()])}
               >
-                <option value="none">None</option>
-                <option value="play">Play</option>
-                <option value="stop">Stop</option>
-                <option value="fade">Fade</option>
-              </select>
-              <select
-                value={triggers.onStop.targetType}
-                onChange={(e) =>
-                  setTriggers((t) => ({
-                    ...t,
-                    onStop: { ...t.onStop, targetType: e.target.value },
-                  }))
-                }
-              >
-                <option value="pad">Pad</option>
-                <option value="group">Group</option>
-                <option value="scene">Scene</option>
-              </select>
-              <input
-                placeholder="target (sceneId:padId or group name)"
-                value={triggers.onStop.target}
-                onChange={(e) =>
-                  setTriggers((t) => ({
-                    ...t,
-                    onStop: { ...t.onStop, target: e.target.value },
-                  }))
-                }
-              />
-            </div>
-            <div className="rowFlex">
-              <div className="field">
-                <label>Time (ms)</label>
-                <input
-                  type="number"
-                  placeholder="200"
-                  value={triggers.onStop.timeMs}
-                  onChange={(e) =>
-                    setTriggers((t) => ({
-                      ...t,
-                      onStop: { ...t.onStop, timeMs: Number(e.target.value) },
-                    }))
-                  }
-                />
-              </div>
-              <div className="field">
-                <label>Amount (dB)</label>
-                <input
-                  type="number"
-                  placeholder="-12"
-                  value={triggers.onStop.amountDb}
-                  onChange={(e) =>
-                    setTriggers((t) => ({
-                      ...t,
-                      onStop: { ...t.onStop, amountDb: Number(e.target.value) },
-                    }))
-                  }
-                />
-              </div>
+                + Add Trigger
+              </button>
             </div>
           </div>
         </div>
