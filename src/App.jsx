@@ -90,6 +90,19 @@ function App() {
   const [mapperOpen, setMapperOpen] = useState(false);
   // Active group selection (e.g., which row we are controlling)
   const [activeGroupKey, setActiveGroupKey] = useState("background");
+  // Latest values for use inside MIDI handlers
+  const activeGroupRef = useRef(activeGroupKey);
+  useEffect(() => {
+    activeGroupRef.current = activeGroupKey;
+  }, [activeGroupKey]);
+  // Soft-takeover latch map: `${groupKey}:${padId}` -> latched boolean
+  const sliderLatchRef = useRef(new Map());
+  useEffect(() => {
+    // Reset latches whenever group or scene changes
+    try {
+      sliderLatchRef.current = new Map();
+    } catch {}
+  }, [activeGroupKey, currentSceneId]);
 
   // Web MIDI state for APC LED control
   const [midiAccess, setMidiAccess] = useState(null);
@@ -108,6 +121,12 @@ function App() {
   const currentScene = useMemo(() => {
     return show.scenes.find((s) => s.id === currentSceneId) || show.scenes[0];
   }, [show, currentSceneId]);
+
+  // Ref mirror for MIDI handlers
+  const currentSceneRef = useRef(currentScene);
+  useEffect(() => {
+    currentSceneRef.current = currentScene;
+  }, [currentScene]);
 
   const groupColors = useMemo(() => {
     const map = {};
@@ -161,8 +180,15 @@ function App() {
         try {
           inp.onmidimessage = (e) => {
             const [status, d1, d2] = e.data;
+            const statusHi = status & 0xf0;
+            const ch = (status & 0x0f) + 1; // 1..16
+            // Handle CC for volume faders (CC7 on channels 1..8)
+            if (statusHi === 0xb0 && d1 === 7 /* CC7 */ && ch >= 1 && ch <= 8) {
+              handleApcFader(ch, d2);
+              return;
+            }
             // Note On with velocity > 0
-            if ((status & 0xf0) === 0x90 && d2 > 0) {
+            if (statusHi === 0x90 && d2 > 0) {
               const note = d1 | 0; // 0..127
               // Handle group selection buttons first
               if (GROUP_SELECT_NOTES.includes(note)) {
@@ -424,6 +450,46 @@ function App() {
         } catch {}
       });
     } catch {}
+  }
+
+  // Convert CC value (0..127) to linear volume 0..1
+  function ccToVolume(cc) {
+    return Math.max(0, Math.min(1, cc / 127));
+  }
+
+  // Map channel (1..8) and current active group to the pad in that column
+  function getPadForFader(channel) {
+    const scene = currentSceneRef.current;
+    const groupKey = activeGroupRef.current;
+    if (!scene || !groupKey) return null;
+    const arr = groupArray(scene, groupKey) || [];
+    const index = channel - 1; // 1..8 -> 0..7
+    if (index < 0 || index >= 8) return null; // ignore >8
+    const pad = arr[index];
+    if (!pad) return null;
+    return { pad, groupKey };
+  }
+
+  // Soft-takeover handler for CC7 faders
+  function handleApcFader(channel, value /*0..127*/) {
+    const target = getPadForFader(channel);
+    if (!target) return;
+    const { pad, groupKey } = target;
+    const key = `${groupKey}:${pad.id}`;
+    const desired = ccToVolume(value);
+    const current = typeof pad.level === "number" ? pad.level : 0;
+    const latched = sliderLatchRef.current.get(key) === true;
+    // Threshold for matching before latch (to avoid sudden jumps)
+    const threshold = 0.04; // ~5/127
+    if (!latched) {
+      if (Math.abs(desired - current) <= threshold) {
+        sliderLatchRef.current.set(key, true);
+      } else {
+        return; // ignore until user matches current level
+      }
+    }
+    // Apply new level once latched
+    setPadLevel(groupKey, pad.id, desired);
   }
 
   function clearAllApcLeds(channel = 0) {
