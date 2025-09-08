@@ -650,20 +650,43 @@ function App() {
   }
 
   // --- Audio engine ---
-  function ensureAudioContext() {
-    if (!audioCtxRef.current) {
-      // eslint-disable-next-line no-undef
-      const AC = window.AudioContext || window.webkitAudioContext;
-      if (!AC) return null;
-      audioCtxRef.current = new AC();
-    }
+  // Routing helpers (use HTMLAudioElement.setSinkId when available)
+  function ensureRoutingSettings() {
+    const s = show?.settings || {};
+    const audioRouting = s.audioRouting || {};
+    const outputs = Array.isArray(audioRouting.outputs)
+      ? audioRouting.outputs
+      : [{ key: "master", label: "Master", deviceId: "default" }];
+    const groupDefault = audioRouting.groupDefault || {
+      background: "master",
+      ambients: "master",
+      sfx: "master",
+    };
+    return { outputs, groupDefault };
+  }
+
+  function getDeviceIdForRouteKey(routeKey) {
     try {
-      if (audioCtxRef.current.state === "suspended") {
-        // Resume on user gesture (play button click)
-        audioCtxRef.current.resume();
-      }
-    } catch {}
-    return audioCtxRef.current;
+      const { outputs } = ensureRoutingSettings();
+      const o = outputs.find((x) => x.key === routeKey);
+      return o?.deviceId || "default";
+    } catch {
+      return "default";
+    }
+  }
+
+  function getRouteKeyForPad(groupKey, pad) {
+    try {
+      if (pad?.routeKey) return pad.routeKey;
+      const { groupDefault } = ensureRoutingSettings();
+      return groupDefault?.[groupKey] || "master";
+    } catch {
+      return "master";
+    }
+  }
+  function ensureAudioContext() {
+    // Deprecated for routing: keep for potential future use; not required when using HTMLAudioElement routing
+    return null;
   }
 
   function padKey(sceneId, groupKey, padId) {
@@ -680,8 +703,6 @@ function App() {
   }
 
   function playPad(sceneId, groupKey, pad) {
-    const ctx = ensureAudioContext();
-    if (!ctx) return;
     const key = padKey(sceneId, groupKey, pad.id);
     stopPad(sceneId, groupKey, pad.id);
     const srcUrl =
@@ -698,11 +719,15 @@ function App() {
     const el = new Audio(srcUrl);
     el.crossOrigin = "anonymous";
     el.loop = pad.playbackMode === "loop";
-    const source = ctx.createMediaElementSource(el);
-    const gain = ctx.createGain();
-    gain.gain.value = clamp01(pad.level ?? 0.8);
-    source.connect(gain).connect(ctx.destination);
-    padAudioRef.current.set(key, { el, gain });
+    try {
+      const routeKey = getRouteKeyForPad(groupKey, pad);
+      const deviceId = getDeviceIdForRouteKey(routeKey);
+      if (typeof el.setSinkId === "function" && deviceId) {
+        Promise.resolve(el.setSinkId(deviceId)).catch(() => {});
+      }
+    } catch {}
+    el.volume = clamp01(pad.level ?? 0.8);
+    padAudioRef.current.set(key, { el });
     el.onended = () => {
       if (!el.loop) {
         // Reflect stopped state in UI
@@ -739,9 +764,6 @@ function App() {
       ref.el.pause();
       ref.el.currentTime = 0;
     } catch {}
-    try {
-      ref.gain.disconnect();
-    } catch {}
     padAudioRef.current.delete(key);
   }
 
@@ -749,7 +771,23 @@ function App() {
     const key = padKey(sceneId, groupKey, padId);
     const ref = padAudioRef.current.get(key);
     if (!ref) return;
-    ref.gain.gain.value = clamp01(level);
+    try {
+      ref.el.volume = clamp01(level);
+    } catch {}
+  }
+
+  function stopAllAudio() {
+    try {
+      padAudioRef.current.forEach((ref, key) => {
+        try {
+          ref.el.pause();
+          ref.el.currentTime = 0;
+        } catch {}
+      });
+    } catch {}
+    try {
+      padAudioRef.current.clear();
+    } catch {}
   }
 
   function runPadTriggers(scene, pad, phase) {
@@ -1320,7 +1358,29 @@ function App() {
           style={{ position: "absolute", left: 0, bottom: 0, padding: 12 }}
         />
       )}
-      {settingsOpen && <SettingsModal onClose={() => setSettingsOpen(false)} />}
+      {settingsOpen && (
+        <SettingsModal
+          settings={show.settings}
+          scene={currentScene}
+          onUpdatePadRoute={(groupKey, id, routeKey) => {
+            updateScene((scene) => {
+              const pad = findPad(scene, groupKey, id);
+              if (pad) pad.routeKey = routeKey || undefined;
+              return scene;
+            });
+          }}
+          onUpdateSettings={(updater) => {
+            setShow((prev) => ({
+              ...prev,
+              settings:
+                typeof updater === "function"
+                  ? updater(structuredClone(prev.settings || {}))
+                  : { ...prev.settings, ...updater },
+            }));
+          }}
+          onClose={() => setSettingsOpen(false)}
+        />
+      )}
       {mapperOpen && <ApcMapperModal onClose={() => setMapperOpen(false)} />}
       {relinkRequired && (
         <RelinkModal
@@ -1333,6 +1393,7 @@ function App() {
         <SoundEditorDrawer
           editor={editor}
           scene={currentScene}
+          settings={show.settings}
           groups={show.groups}
           scenes={show.scenes}
           onClose={() =>
@@ -1389,6 +1450,7 @@ function App() {
       const pad = findPad(scene, groupKey, id);
       if (!pad) return scene;
       pad.playing = !!playing;
+      handlePadAudio(scene, groupKey, pad, !!playing);
       return scene;
     };
     if (targetSceneId !== currentScene.id)
@@ -1647,25 +1709,8 @@ function PadCard({
       normalize: true,
     });
     wsRef.current.load(pad.assetUrl || pad.assetPath);
-    const onPlay = () => onSetPlaying?.(true);
-    const onPause = () => onSetPlaying?.(false);
-    const onFinish = () => {
-      if (pad.playbackMode === "loop") {
-        try {
-          wsRef.current?.play(0);
-        } catch {}
-      } else {
-        onPause();
-      }
-    };
-    wsRef.current.on("play", onPlay);
-    wsRef.current.on("pause", onPause);
-    wsRef.current.on("finish", onFinish);
     return () => {
       try {
-        wsRef.current?.un("play", onPlay);
-        wsRef.current?.un("pause", onPause);
-        wsRef.current?.un("finish", onFinish);
         wsRef.current?.destroy();
       } catch {}
       wsRef.current = null;
@@ -1673,62 +1718,7 @@ function PadCard({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pad.assetUrl, pad.assetPath, pad.playbackMode]);
 
-  // Sync external playing state (e.g., MIDI toggle) to WaveSurfer instance
-  useEffect(() => {
-    const ws = wsRef.current;
-    if (!ws) return;
-    try {
-      const isPlaying = typeof ws.isPlaying === "function" && ws.isPlaying();
-      if (pad.playing && !isPlaying) {
-        const target = pad.level || 0;
-        const fadeMs = typeof pad.fadeInMs === "number" ? pad.fadeInMs : 0;
-        if (fadeMs > 0) {
-          ws.setVolume?.(0);
-          ws.play?.(0);
-          const t0 = performance.now();
-          const step = (t) => {
-            const p = Math.min(1, (t - t0) / fadeMs);
-            const v = target * p;
-            try {
-              ws.setVolume?.(v);
-            } catch {}
-            if (p < 1) requestAnimationFrame(step);
-          };
-          requestAnimationFrame(step);
-        } else {
-          ws.setVolume?.(target);
-          ws.play?.(0);
-        }
-      } else if (!pad.playing && isPlaying) {
-        const startVol =
-          (typeof ws.getVolume === "function"
-            ? ws.getVolume()
-            : pad.level || 0) || 0;
-        const durationMs =
-          typeof pad.fadeOutMs === "number" ? pad.fadeOutMs : 500;
-        if (durationMs > 0) {
-          const t0 = performance.now();
-          const step = (t) => {
-            const p = Math.min(1, (t - t0) / durationMs);
-            const v = Math.max(0, startVol * (1 - p));
-            try {
-              ws.setVolume?.(v);
-            } catch {}
-            if (p < 1) requestAnimationFrame(step);
-            else {
-              try {
-                ws.pause?.();
-                ws.setVolume?.(startVol);
-              } catch {}
-            }
-          };
-          requestAnimationFrame(step);
-        } else {
-          ws.pause?.();
-        }
-      }
-    } catch {}
-  }, [pad.playing, pad.level, pad.fadeInMs, pad.fadeOutMs]);
+  // Do not drive WaveSurfer playback; it is used for visualization only.
 
   // Apply volume changes immediately to WaveSurfer when level changes
   useEffect(() => {
@@ -1795,113 +1785,11 @@ function PadCard({
                   className="btn sm"
                   onClick={(e) => {
                     e.stopPropagation();
-                    try {
-                      const ws = wsRef.current;
-                      if (!ws) return;
-                      if (ws.isPlaying && ws.isPlaying()) {
-                        const startVol =
-                          (typeof ws.getVolume === "function"
-                            ? ws.getVolume()
-                            : pad.level || 0) || 0;
-                        const durationMs =
-                          typeof pad.fadeOutMs === "number"
-                            ? pad.fadeOutMs
-                            : 500;
-                        const t0 = performance.now();
-                        const step = (t) => {
-                          const p = Math.min(1, (t - t0) / durationMs);
-                          const v = Math.max(0, startVol * (1 - p));
-                          try {
-                            ws.setVolume?.(v);
-                          } catch {}
-                          if (p < 1) requestAnimationFrame(step);
-                          else {
-                            try {
-                              ws.pause?.();
-                              // restore for next play
-                              ws.setVolume?.(startVol);
-                            } catch {}
-                          }
-                        };
-                        requestAnimationFrame(step);
-                      } else {
-                        try {
-                          const target = pad.level || 0;
-                          const fadeMs =
-                            typeof pad.fadeInMs === "number" ? pad.fadeInMs : 0;
-                          if (fadeMs > 0) {
-                            ws.setVolume?.(0);
-                            ws.play?.(0);
-                            const t0 = performance.now();
-                            const step = (t) => {
-                              const p = Math.min(1, (t - t0) / fadeMs);
-                              const v = target * p;
-                              try {
-                                ws.setVolume?.(v);
-                              } catch {}
-                              if (p < 1) requestAnimationFrame(step);
-                            };
-                            requestAnimationFrame(step);
-                          } else {
-                            ws.setVolume?.(target);
-                            ws.play?.(0);
-                          }
-                        } catch {}
-                      }
-                    } catch {}
+                    onToggle?.();
                   }}
                 >
                   {pad.playing ? "Pause" : "Play"}
                 </button>
-                {!pad.playing &&
-                  (() => {
-                    try {
-                      const ws = wsRef.current;
-                      const canResume =
-                        !!ws &&
-                        typeof ws.getCurrentTime === "function" &&
-                        ws.getCurrentTime() > 0;
-                      if (!canResume) return null;
-                    } catch {
-                      return null;
-                    }
-                    return (
-                      <button
-                        className="btn sm"
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          try {
-                            const ws = wsRef.current;
-                            if (!ws) return;
-                            const target = pad.level || 0;
-                            const fadeMs =
-                              typeof pad.fadeInMs === "number"
-                                ? pad.fadeInMs
-                                : 0;
-                            if (fadeMs > 0) {
-                              ws.setVolume?.(0);
-                              ws.play?.();
-                              const t0 = performance.now();
-                              const step = (t) => {
-                                const p = Math.min(1, (t - t0) / fadeMs);
-                                const v = target * p;
-                                try {
-                                  ws.setVolume?.(v);
-                                } catch {}
-                                if (p < 1) requestAnimationFrame(step);
-                              };
-                              requestAnimationFrame(step);
-                            } else {
-                              ws.setVolume?.(target);
-                              ws.play?.();
-                            }
-                          } catch {}
-                        }}
-                      >
-                        Resume
-                      </button>
-                    );
-                  })()}
                 <input
                   type="range"
                   min="0"
@@ -1910,9 +1798,6 @@ function PadCard({
                   value={pad.level || 0}
                   onChange={(e) => {
                     onLevelChange(Number(e.target.value));
-                    try {
-                      wsRef.current?.setVolume(Number(e.target.value));
-                    } catch {}
                   }}
                 />
               </div>
@@ -2519,7 +2404,7 @@ async function loadRootDirectoryHandle() {
   }
 }
 
-function SettingsModal({ onClose }) {
+function SettingsModal({ settings, scene, onUpdateSettings, onUpdatePadRoute, onClose }) {
   const [log, setLog] = useState([]);
   const [midiAccess, setMidiAccess] = useState(null);
   const [webInId, setWebInId] = useState("");
@@ -2530,6 +2415,17 @@ function SettingsModal({ onClose }) {
   const [testName, setTestName] = useState("");
   const [testMsg, setTestMsg] = useState("");
   const audioRef = useRef(null);
+  const [audioOutputs, setAudioOutputs] = useState([]);
+
+  const routing = settings?.audioRouting || {};
+  const outputs = Array.isArray(routing.outputs)
+    ? routing.outputs
+    : [{ key: "master", label: "Master", deviceId: "default" }];
+  const groupDefault = routing.groupDefault || {
+    background: "master",
+    ambients: "master",
+    sfx: "master",
+  };
 
   useEffect(() => {
     const supported =
@@ -2563,6 +2459,21 @@ function SettingsModal({ onClose }) {
         } catch {}
       }
     };
+  }, []);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        if (!navigator.mediaDevices?.enumerateDevices) return;
+        // In some browsers, device labels require prior permission
+        try {
+          await navigator.mediaDevices.getUserMedia({ audio: true });
+        } catch {}
+        const list = await navigator.mediaDevices.enumerateDevices();
+        const outs = list.filter((d) => d.kind === "audiooutput");
+        setAudioOutputs(outs);
+      } catch {}
+    })();
   }, []);
 
   function connectInWeb() {
@@ -2633,20 +2544,247 @@ function SettingsModal({ onClose }) {
           </button>
         </div>
         <div className="modalBody">
-          <div style={{ display: "none" }}>Audio</div>
+          <div style={{ marginBottom: 6, color: "#bbb" }}>Audio</div>
           <div className="rowFlex">
-            <div className="field">
-              <label>Master Device</label>
-              <select defaultValue="default">
+            <div className="field" style={{ flex: 2 }}>
+              <label>Master Sound Output</label>
+              <select
+                value={outputs[0]?.deviceId || "default"}
+                onChange={(e) => {
+                  const deviceId = e.target.value;
+                  onUpdateSettings((prev) => {
+                    const next = structuredClone(prev || {});
+                    const list = Array.isArray(next.audioRouting?.outputs)
+                      ? next.audioRouting.outputs
+                      : [{ key: "master", label: "Master", deviceId: "default" }];
+                    list[0] = { ...(list[0] || { key: "master", label: "Master" }), deviceId };
+                    next.audioRouting = {
+                      ...(next.audioRouting || {}),
+                      outputs: list,
+                      groupDefault: next.audioRouting?.groupDefault || groupDefault,
+                    };
+                    return next;
+                  });
+                }}
+              >
                 <option value="default">System Default</option>
+                {audioOutputs.map((d) => (
+                  <option key={d.deviceId || d.label} value={d.deviceId || "default"}>
+                    {d.label || `Device ${d.deviceId || ""}`}
+                  </option>
+                ))}
               </select>
             </div>
-            <div className="field">
+            <div className="field" style={{ flex: 1 }}>
               <label>Sample Rate</label>
-              <select defaultValue="48000">
+              <select
+                value={String(settings?.sampleRate || 48000)}
+                onChange={(e) => onUpdateSettings({ sampleRate: Number(e.target.value) })}
+              >
                 <option value="44100">44.1 kHz</option>
                 <option value="48000">48 kHz</option>
               </select>
+            </div>
+          </div>
+          <div className="field" style={{ marginTop: 10 }}>
+            <button
+              className="btn sm"
+              onClick={() => {
+                onUpdateSettings((prev) => {
+                  const next = structuredClone(prev || {});
+                  const list = Array.isArray(next.audioRouting?.outputs)
+                    ? next.audioRouting.outputs
+                    : [{ key: "master", label: "Master", deviceId: outputs[0]?.deviceId || "default" }];
+                  const idx = list.length + 1;
+                  const key = idx === 1 ? "master" : `out${idx}`;
+                  const label = idx === 1 ? "Master" : `Output ${idx}`;
+                  list.push({ key, label, deviceId: "default" });
+                  next.audioRouting = {
+                    ...(next.audioRouting || {}),
+                    outputs: list,
+                    groupDefault: next.audioRouting?.groupDefault || groupDefault,
+                  };
+                  return next;
+                });
+              }}
+            >
+              + Add New Output
+            </button>
+          </div>
+          {outputs.slice(1).length > 0 && (
+            <div className="field" style={{ marginTop: 8 }}>
+              <label>Additional Outputs</label>
+              <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                {outputs.slice(1).map((o, i) => (
+                  <div key={o.key} className="rowFlex">
+                    <input
+                      style={{ flex: 1 }}
+                      value={o.label || `Output ${i + 2}`}
+                      onChange={(e) => {
+                        onUpdateSettings((prev) => {
+                          const next = structuredClone(prev || {});
+                          const list = Array.isArray(next.audioRouting?.outputs)
+                            ? next.audioRouting.outputs
+                            : outputs;
+                          const idx = 1 + i;
+                          list[idx] = { ...list[idx], label: e.target.value };
+                          next.audioRouting = { ...(next.audioRouting || {}), outputs: list, groupDefault };
+                          return next;
+                        });
+                      }}
+                    />
+                    <select
+                      style={{ flex: 2 }}
+                      value={o.deviceId || "default"}
+                      onChange={(e) => {
+                        const deviceId = e.target.value;
+                        onUpdateSettings((prev) => {
+                          const next = structuredClone(prev || {});
+                          const list = Array.isArray(next.audioRouting?.outputs)
+                            ? next.audioRouting.outputs
+                            : outputs;
+                          const idx = 1 + i;
+                          list[idx] = { ...list[idx], deviceId };
+                          next.audioRouting = { ...(next.audioRouting || {}), outputs: list, groupDefault };
+                          return next;
+                        });
+                      }}
+                    >
+                      <option value="default">System Default</option>
+                      {audioOutputs.map((d) => (
+                        <option key={d.deviceId || d.label} value={d.deviceId || "default"}>
+                          {d.label || `Device ${d.deviceId || ""}`}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          <div style={{ margin: "16px 0", color: "#bbb" }}>Default Routing</div>
+          <div className="rowFlex">
+            <div className="field">
+              <label>Background</label>
+              <select
+                value={groupDefault.background || "master"}
+                onChange={(e) =>
+                  onUpdateSettings((prev) => {
+                    const next = structuredClone(prev || {});
+                    const gd = { ...(next.audioRouting?.groupDefault || groupDefault), background: e.target.value };
+                    next.audioRouting = { ...(next.audioRouting || {}), outputs, groupDefault: gd };
+                    return next;
+                  })
+                }
+              >
+                {outputs.map((o) => (
+                  <option key={o.key} value={o.key}>
+                    {o.label}
+                  </option>
+                ))}
+              </select>
+            </div>
+            <div className="field">
+              <label>Ambient</label>
+              <select
+                value={groupDefault.ambients || "master"}
+                onChange={(e) =>
+                  onUpdateSettings((prev) => {
+                    const next = structuredClone(prev || {});
+                    const gd = { ...(next.audioRouting?.groupDefault || groupDefault), ambients: e.target.value };
+                    next.audioRouting = { ...(next.audioRouting || {}), outputs, groupDefault: gd };
+                    return next;
+                  })
+                }
+              >
+                {outputs.map((o) => (
+                  <option key={o.key} value={o.key}>
+                    {o.label}
+                  </option>
+                ))}
+              </select>
+            </div>
+            <div className="field">
+              <label>SFX</label>
+              <select
+                value={groupDefault.sfx || "master"}
+                onChange={(e) =>
+                  onUpdateSettings((prev) => {
+                    const next = structuredClone(prev || {});
+                    const gd = { ...(next.audioRouting?.groupDefault || groupDefault), sfx: e.target.value };
+                    next.audioRouting = { ...(next.audioRouting || {}), outputs, groupDefault: gd };
+                    return next;
+                  })
+                }
+              >
+                {outputs.map((o) => (
+                  <option key={o.key} value={o.key}>
+                    {o.label}
+                  </option>
+                ))}
+              </select>
+            </div>
+          </div>
+
+          <div style={{ margin: "16px 0", color: "#bbb" }}>Per-Pad Routing (Current Scene)</div>
+          <div className="rowFlex">
+            <div className="field" style={{ flex: 1 }}>
+              <label>Background</label>
+              {(scene?.background || []).map((p) => (
+                <div key={p.id} className="rowFlex" style={{ gap: 6, marginBottom: 6 }}>
+                  <div style={{ width: 140, color: "#ddd" }}>{p.label || p.name}</div>
+                  <select
+                    style={{ flex: 1 }}
+                    value={p.routeKey || "master"}
+                    onChange={(e) => onUpdatePadRoute?.("background", p.id, e.target.value)}
+                  >
+                    {outputs.map((o) => (
+                      <option key={o.key} value={o.key}>
+                        {o.label}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              ))}
+            </div>
+            <div className="field" style={{ flex: 1 }}>
+              <label>Ambient</label>
+              {(scene?.ambients || []).map((p) => (
+                <div key={p.id} className="rowFlex" style={{ gap: 6, marginBottom: 6 }}>
+                  <div style={{ width: 140, color: "#ddd" }}>{p.label || p.name}</div>
+                  <select
+                    style={{ flex: 1 }}
+                    value={p.routeKey || "master"}
+                    onChange={(e) => onUpdatePadRoute?.("ambients", p.id, e.target.value)}
+                  >
+                    {outputs.map((o) => (
+                      <option key={o.key} value={o.key}>
+                        {o.label}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              ))}
+            </div>
+            <div className="field" style={{ flex: 1 }}>
+              <label>SFX</label>
+              {(scene?.sfx || []).map((p) => (
+                <div key={p.id} className="rowFlex" style={{ gap: 6, marginBottom: 6 }}>
+                  <div style={{ width: 140, color: "#ddd" }}>{p.label || p.name}</div>
+                  <select
+                    style={{ flex: 1 }}
+                    value={p.routeKey || "master"}
+                    onChange={(e) => onUpdatePadRoute?.("sfx", p.id, e.target.value)}
+                  >
+                    {outputs.map((o) => (
+                      <option key={o.key} value={o.key}>
+                        {o.label}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              ))}
             </div>
           </div>
           {/* Audio Test Player removed per UI cleanup */}
@@ -2917,7 +3055,7 @@ function ApcMapperModal({ onClose }) {
   );
 }
 
-function SoundEditorDrawer({ editor, scene, groups, onClose, onSave }) {
+function SoundEditorDrawer({ editor, scene, settings, groups, onClose, onSave }) {
   const pad = editor.padId
     ? findPad(scene, editor.groupKey, editor.padId)
     : null;
