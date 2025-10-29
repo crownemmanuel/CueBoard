@@ -41,6 +41,7 @@ body {
   flex-direction: column;
   gap: 8px;
   border-right: 1px solid #3a3a3a;
+  overflow-y: auto;
 }
 
 .brandRow {
