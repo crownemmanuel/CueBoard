@@ -2,6 +2,18 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import logoUrl from "./cue-board.logo.png";
 import WaveSurfer from "wavesurfer.js";
 import "./App.css";
+import {
+  isElectron,
+  isDirectoryPickerSupported,
+  selectDirectory,
+  getLastDirectory,
+  readDirectoryFiles,
+  getAudioFileUrl,
+  saveShowData,
+  loadShowData,
+  saveFileMappings,
+  loadFileMappings,
+} from "./electronFileSystem";
 
 // APC40 mkII restricted color palette and helpers
 const APC_COLOR_TABLE = [
@@ -511,10 +523,24 @@ function App() {
     (async () => {
       if (attemptedAutoRelinkRef.current) return;
       attemptedAutoRelinkRef.current = true;
-      const supported =
-        typeof window !== "undefined" && !!window.showDirectoryPicker;
+      const supported = isDirectoryPickerSupported();
       let autoLinked = false;
-      if (supported) {
+      
+      // In Electron, try to auto-load from last directory
+      if (isElectron()) {
+        try {
+          const lastDir = await getLastDirectory();
+          if (lastDir) {
+            autoLinked = await autoRelinkFromDirectory(
+              lastDir,
+              setShow,
+              setStatus,
+              show
+            );
+          }
+        } catch {}
+      } else if (supported) {
+        // In browser, try from IndexedDB
         try {
           autoLinked = await autoRelinkFromStoredHandle(
             setShow,
@@ -523,6 +549,7 @@ function App() {
           );
         } catch {}
       }
+      
       const missing = countRelinkCandidates(show);
       if (!autoLinked && missing > 0 && supported) {
         setRelinkMissingCount(missing);
@@ -1576,7 +1603,7 @@ function App() {
   }
 
   async function relinkFromDirectory() {
-    if (typeof window === "undefined" || !window.showDirectoryPicker) {
+    if (!isDirectoryPickerSupported()) {
       try {
         alert(
           "Folder picker not supported in this browser. Use Edit to reattach files."
@@ -1585,62 +1612,28 @@ function App() {
       return;
     }
     try {
-      const dir = await window.showDirectoryPicker({});
-      // Try to persist storage and remember handle for future auto-relink
-      try {
-        await navigator.storage?.persist?.();
-      } catch {}
-      try {
-        await saveRootDirectoryHandle(dir);
-      } catch {}
-      setStatus("Indexing folder...");
-      const index = await indexDirectoryFiles(dir);
-      const needed = [];
-      (show.scenes || []).forEach((scene) => {
-        ["background", "ambients", "sfx"].forEach((gk) => {
-          (scene[gk] || []).forEach((p) => {
-            const name = fileNameFromPath(p.assetPath || "");
-            if (!name || isUrlLike(name) || p.assetUrl) return;
-            needed.push(name.toLowerCase());
-          });
-        });
-      });
-      const unique = Array.from(new Set(needed));
-      const nameToUrl = new Map();
-      let created = 0;
-      for (const name of unique) {
-        const handle = index.get(name);
-        if (!handle) continue;
+      const dir = await selectDirectory();
+      if (!dir) return; // User cancelled
+      
+      // Try to persist storage and remember handle for future auto-relink (browser only)
+      if (!isElectron()) {
         try {
-          const file = await handle.getFile();
-          const url = URL.createObjectURL(file);
-          nameToUrl.set(name, url);
-          created++;
+          await navigator.storage?.persist?.();
+        } catch {}
+        try {
+          await saveRootDirectoryHandle(dir);
         } catch {}
       }
-      let linked = 0;
-      setShow((prev) => {
-        const next = structuredClone(prev);
-        (next.scenes || []).forEach((scene) => {
-          ["background", "ambients", "sfx"].forEach((gk) => {
-            (scene[gk] || []).forEach((p) => {
-              const key = fileNameFromPath(p.assetPath || "");
-              const url = nameToUrl.get(key);
-              if (url) {
-                p.assetUrl = url;
-                linked++;
-              }
-            });
-          });
-        });
-        return next;
-      });
-      setStatus(`Relinked ${linked}/${unique.length} file(s)`);
-      // Close the modal after an attempt (user selected a folder)
-      setRelinkRequired(false);
-      setRelinkMissingCount(0);
-    } catch {
-      // user cancelled or error
+      
+      const linked = await autoRelinkFromDirectory(dir, setShow, setStatus, show);
+      if (linked) {
+        // Close the modal after successful relink
+        setRelinkRequired(false);
+        setRelinkMissingCount(0);
+      }
+    } catch (err) {
+      console.error("Relink error:", err);
+      setStatus("Relink failed");
     }
   }
 
@@ -3258,6 +3251,78 @@ function fileNameFromPath(pathLike) {
   const s = String(pathLike);
   const idx = Math.max(s.lastIndexOf("/"), s.lastIndexOf("\\"));
   return (idx >= 0 ? s.slice(idx + 1) : s).toLowerCase();
+}
+
+// Unified auto-relink function that works with both Electron and browser directory handles
+async function autoRelinkFromDirectory(dir, setShow, setStatus, show) {
+  try {
+    setStatus && setStatus("Indexing folder...");
+    
+    // Get list of audio files from directory
+    const files = await readDirectoryFiles(dir);
+    
+    // Build a map of filename -> file info
+    const fileMap = new Map();
+    files.forEach(file => {
+      const name = file.name.toLowerCase();
+      fileMap.set(name, file);
+    });
+    
+    // Find all files that need linking
+    const needed = [];
+    (show.scenes || []).forEach((scene) => {
+      ["background", "ambients", "sfx"].forEach((gk) => {
+        (scene[gk] || []).forEach((p) => {
+          const name = fileNameFromPath(p.assetPath || "");
+          if (!name || isUrlLike(name) || p.assetUrl) return;
+          needed.push(name.toLowerCase());
+        });
+      });
+    });
+    
+    const unique = Array.from(new Set(needed));
+    const nameToUrl = new Map();
+    let created = 0;
+    
+    // Create URLs for each needed file
+    for (const name of unique) {
+      const fileInfo = fileMap.get(name);
+      if (!fileInfo) continue;
+      try {
+        const url = await getAudioFileUrl(fileInfo);
+        nameToUrl.set(name, url);
+        created++;
+      } catch (err) {
+        console.warn(`Failed to get URL for ${name}:`, err);
+      }
+    }
+    
+    // Update show with new URLs
+    let linked = 0;
+    setShow((prev) => {
+      const next = structuredClone(prev);
+      (next.scenes || []).forEach((scene) => {
+        ["background", "ambients", "sfx"].forEach((gk) => {
+          (scene[gk] || []).forEach((p) => {
+            const key = fileNameFromPath(p.assetPath || "");
+            const url = nameToUrl.get(key);
+            if (url) {
+              p.assetUrl = url;
+              linked++;
+            }
+          });
+        });
+      });
+      return next;
+    });
+    
+    setStatus && setStatus(`Relinked ${linked}/${unique.length} file(s)`);
+    return linked > 0;
+  } catch (err) {
+    console.error("Auto-relink error:", err);
+    setStatus && setStatus("Relink failed");
+    return false;
+  }
 }
 
 // Attempt to re-link using a previously saved directory handle from IndexedDB
