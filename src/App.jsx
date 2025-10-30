@@ -149,6 +149,33 @@ function App() {
     });
     return saved;
   });
+  
+  // Load show data from Electron store on mount (happens after initial render)
+  useEffect(() => {
+    if (isElectron()) {
+      (async () => {
+        try {
+          const electronShow = await loadShowData();
+          if (electronShow) {
+            // Clear playing states
+            electronShow.scenes.forEach((scene) => {
+              ["background", "ambients", "sfx"].forEach((groupKey) => {
+                if (scene[groupKey]) {
+                  scene[groupKey].forEach((pad) => {
+                    pad.playing = false;
+                  });
+                }
+              });
+            });
+            setShow(electronShow);
+            console.log("Loaded show data from Electron store");
+          }
+        } catch (err) {
+          console.error("Failed to load show from Electron:", err);
+        }
+      })();
+    }
+  }, []);
   const [currentSceneId, setCurrentSceneId] = useState(show.scenes[0]?.id);
   const [selectedPadKey, setSelectedPadKey] = useState(null);
   const [notesOpen, setNotesOpen] = useState(true);
@@ -295,6 +322,13 @@ function App() {
     try {
       const payload = serializeShowForSave(show);
       localStorage.setItem("soundboard.show.v1", JSON.stringify(payload));
+      
+      // Also save to Electron store if running in Electron
+      if (isElectron()) {
+        saveShowData(show).catch((err) => {
+          console.error("Failed to save show to Electron:", err);
+        });
+      }
     } catch {}
   }, [show]);
 
@@ -525,7 +559,7 @@ function App() {
       attemptedAutoRelinkRef.current = true;
       const supported = isDirectoryPickerSupported();
       let autoLinked = false;
-      
+
       // In Electron, try to auto-load from last directory
       if (isElectron()) {
         try {
@@ -549,7 +583,7 @@ function App() {
           );
         } catch {}
       }
-      
+
       const missing = countRelinkCandidates(show);
       if (!autoLinked && missing > 0 && supported) {
         setRelinkMissingCount(missing);
@@ -1614,7 +1648,7 @@ function App() {
     try {
       const dir = await selectDirectory();
       if (!dir) return; // User cancelled
-      
+
       // Try to persist storage and remember handle for future auto-relink (browser only)
       if (!isElectron()) {
         try {
@@ -1624,8 +1658,13 @@ function App() {
           await saveRootDirectoryHandle(dir);
         } catch {}
       }
-      
-      const linked = await autoRelinkFromDirectory(dir, setShow, setStatus, show);
+
+      const linked = await autoRelinkFromDirectory(
+        dir,
+        setShow,
+        setStatus,
+        show
+      );
       if (linked) {
         // Close the modal after successful relink
         setRelinkRequired(false);
@@ -3257,17 +3296,17 @@ function fileNameFromPath(pathLike) {
 async function autoRelinkFromDirectory(dir, setShow, setStatus, show) {
   try {
     setStatus && setStatus("Indexing folder...");
-    
+
     // Get list of audio files from directory
     const files = await readDirectoryFiles(dir);
-    
+
     // Build a map of filename -> file info
     const fileMap = new Map();
-    files.forEach(file => {
+    files.forEach((file) => {
       const name = file.name.toLowerCase();
       fileMap.set(name, file);
     });
-    
+
     // Find all files that need linking
     const needed = [];
     (show.scenes || []).forEach((scene) => {
@@ -3279,11 +3318,11 @@ async function autoRelinkFromDirectory(dir, setShow, setStatus, show) {
         });
       });
     });
-    
+
     const unique = Array.from(new Set(needed));
     const nameToUrl = new Map();
     let created = 0;
-    
+
     // Create URLs for each needed file
     for (const name of unique) {
       const fileInfo = fileMap.get(name);
@@ -3296,7 +3335,7 @@ async function autoRelinkFromDirectory(dir, setShow, setStatus, show) {
         console.warn(`Failed to get URL for ${name}:`, err);
       }
     }
-    
+
     // Update show with new URLs
     let linked = 0;
     setShow((prev) => {
@@ -3315,7 +3354,7 @@ async function autoRelinkFromDirectory(dir, setShow, setStatus, show) {
       });
       return next;
     });
-    
+
     setStatus && setStatus(`Relinked ${linked}/${unique.length} file(s)`);
     return linked > 0;
   } catch (err) {
